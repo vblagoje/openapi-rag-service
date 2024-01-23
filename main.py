@@ -1,109 +1,208 @@
 import hashlib
 import json
+import logging
 import os
 import re
 import sys
-from typing import Optional, List
+import time
+from typing import List, Tuple, Dict, Any
+from typing import Optional
+from urllib.parse import urlparse
 
 import requests
 from haystack import Pipeline
 from haystack.components.connectors import OpenAPIServiceConnector
+from haystack.components.converters import OpenAPIServiceToFunctions
 from haystack.components.generators.chat import OpenAIChatGenerator
-from haystack.dataclasses import ChatMessage
+from haystack.dataclasses import ChatMessage, ByteStream
 
 
-def load_file_from(locations: List[str]) -> str:
+def get_env_var_or_default(env_var_name: str, default_value: Optional[str] = None, required: bool = False) -> str:
     """
-    Loads the content of a file from given locations.
-    :param locations: a list of file paths or URLs
-    :return: file content as a string
-    :raises FileNotFoundError: If the file cannot be loaded from any of the given locations.
+    Retrieves the value of an environment variable if it exists, otherwise returns a default value or raises an
+    error if required.
+
+    This function fetches the value of an environment variable specified by `env_var_name`. If the environment
+    variable does not exist, it either returns a `default_value` if provided, or raises a `ValueError` if the
+    `required` flag is set to `True`. If `default_value` is not provided and `required` is `False`, it returns `None`.
+
+    :param env_var_name: The name of the environment variable to retrieve.
+    :type env_var_name: str
+    :param default_value: The default value to return if the environment variable is not found. Defaults to `None`.
+    :type default_value: Optional[str]
+    :param required: If set to `True`, the function raises a `ValueError` when the environment variable is not found. Defaults to `False`.
+    :type required: bool
+    :return: The value of the environment variable or the `default_value`. Returns `None` if the environment variable is not found and `default_value` is `None`.
+    :rtype: str
+    :raises ValueError: If `required` is `True` and the environment variable is not found.
+    """
+    env_var_value = os.environ.get(env_var_name)
+
+    if env_var_value is not None:
+        return env_var_value
+    elif default_value is not None:
+        return default_value
+    elif required:
+        raise ValueError(f"Please set {env_var_name} environment variable.")
+
+    return None
+
+
+def is_valid_url(location: str):
+    """
+    Checks if the location is a valid URL.
+    :param location: a string representing a URL
+    :return: True if the location is a valid URL; otherwise, False.
+    """
+    parsed = urlparse(location)
+    return bool(parsed.netloc)
+
+
+def load_text_from(locations: List[str]) -> Tuple[bool, str]:
+    """
+    Attempts to load text from a list of locations.
+
+    Each location can be a URL, a file path, or an environment variable name.
+    Returns a tuple (success, text or error message).
+
+    :param locations: List of strings representing URLs, file paths, or environment variable names.
+    :return: Tuple containing a boolean indicating success, and the loaded text or error message.
     """
     for location in locations:
         try:
-            # If it's a URL, make a request and return the text content
-            if location.startswith("http://") or location.startswith("https://"):
-                response = requests.get(location)
-                if response.status_code == 200:
-                    return response.text
+            if is_valid_url(location):
+                return load_from_url(location)
 
-            # If it's a local file path, try to open and return the content
             elif os.path.exists(location):
-                with open(location, "r") as file:
-                    return file.read()
+                return load_from_file(location)
+
+            elif location in os.environ:
+                return True, os.environ[location]
+
+            else:
+                return True, location
 
         except Exception as e:
-            print(f"Failed to load from {location}. Error: {e}")
+            logging.error(f"Failed to load text from {location}. Error: {e}")
 
-    raise FileNotFoundError(f"Failed to load from any of the locations: {locations}")
+    return False, "Failed to load from any of the locations."
 
 
-def generate_pr_text(
-    github_repo: str, base_branch: str, pr_branch: str, model_name: str, custom_instruction: Optional[str] = None
+def load_from_url(url: str) -> Tuple[bool, str]:
+    response = requests.get(url)
+    if response.status_code == 200:
+        return True, response.text
+    else:
+        return False, f"Failed to load from URL: {url} with status code: {response.status_code}"
+
+
+def load_from_file(file_path: str) -> Tuple[bool, str]:
+    with open(file_path, "r") as file:
+        return True, file.read()
+
+
+def has_authentication_method(openapi_service_json: Dict[str, Any]) -> bool:
+    """
+    Checks if the OpenAPI service specification contains an authentication method.
+    If so, it is assumed that endpoint requires authentication.
+
+    :param openapi_service_json: The OpenAPI service specification in JSON format.
+    :type openapi_service_json: Dict[str, Any]
+    :return: True if the service specification contains an authentication method; otherwise, False.
+    :rtype: bool
+    """
+    return "components" in openapi_service_json and "securitySchemes" in openapi_service_json["components"]
+
+
+def text_generate(
+    text_model: str,
+    function_model: str,
+    function_model_prompt: str,
+    open_api_service_spec: str,
+    service_response_root: Optional[str] = None,
+    custom_instruction: Optional[str] = None,
 ) -> ChatMessage:
     """
-    Generates a GitHub Pull Request (PR) text based on user instructions.
+    Orchestrates LLM text generation by leveraging a Haystack OpenAPI service functionality. It first converts an
+    OpenAPI service specification into a set of OpenAI callable functions, sets up service authorization, and then
+    invokes OpenAPI service injecting service response into a prompt to generate LLM response based on user prompts
+    and custom user instructions.
 
-    :param github_repo: The GitHub repository in the format 'owner/repo'.
-    :type github_repo: str
-    :param base_branch: The base branch of the PR.
-    :type base_branch: str
-    :param pr_branch: The PR branch.
-    :type pr_branch: str
-    :param model_name: The model to use for PR text generation.
-    :type model_name: str
-    :param custom_instruction: Optional custom instructions for PR text generation, like "Be brief, one
-    sentence per section".
-    :type custom_instruction: Optional[str]
-    :return: A ChatMessage containing the generated PR text along with the generation statistics in the metadata.
+    It's essential to ensure that the `open_api_service_spec` is validated against OpenAPI 3.x schema and properly
+    in formatted JSON string format.
+
+    :param str text_model: The identifier of the text model used for generating the final text.
+    :param str function_model: The identifier of the function calling model used to resolve parameters for
+    OpenAPI service invocation
+    :param str function_model_prompt: The user prompt for the function calling
+    model e.g (What's the weather like in Berlin for the next three days?)
+    :param str open_api_service_spec: The OpenAPI service specification in string JSON format.
+    :param Optional[str] service_response_root: Optional element to extract from the service response. Default is None.
+    :param Optional[str] custom_instruction: Additional custom user instruction for text generation. Default is None.
+    :return: The generated `ChatMessage` based on the provided inputs and interactions with the specified services.
     :rtype: ChatMessage
-    :raises ValueError: If the OPENAI_API_KEY environment variable is not set.
     """
-    # we try loading from different locations as script can run in different environments
-    # e.g. locally, in docker, in GitHub Actions
-    openapi_spec = json.loads(load_file_from(["github_compare_spec.json", "https://bit.ly/github_compare"]))
 
-    system_prompt_text = os.environ.get("AUTO_PR_WRITER_SYSTEM_MESSAGE") or load_file_from(
-        ["system_prompt.txt", "https://bit.ly/auto_pr_writer_system_prompt"]
+    spec_to_functions = OpenAPIServiceToFunctions()
+    openai_functions_definition_docs = spec_to_functions.run(
+        sources=[ByteStream.from_string(text=open_api_service_spec)], system_messages=["TODO-REMOVE-ME"]
     )
+    openai_functions_definition: ChatMessage = openai_functions_definition_docs["documents"][0]
+    openai_functions_definition: str = json.loads(openai_functions_definition.content)
 
-    # a GitHub access token is required to invoke the GitHub compare service and avoid rate limiting
-    service_auth = {"Github API": os.environ.get("GITHUB_TOKEN")}
+    open_api_service_spec_as_json = json.loads(open_api_service_spec)
+    # Setup service authorization token, title is required field in OpenAPI spec
+    service_title = open_api_service_spec_as_json["info"]["title"]
+    if has_authentication_method(open_api_service_spec_as_json):
+        if not service_token:
+            raise ValueError(f"Service {service_title} requires authorization token. "
+                             f"Please set OPENAPI_SERVICE_TOKEN environment variable.")
+        else:
+            service_auth = {service_title: service_token}
+    else:
+        service_auth = None
 
     invoke_service_pipe = Pipeline()
+    invoke_service_pipe.add_component("function_llm", OpenAIChatGenerator(model=function_model))
     invoke_service_pipe.add_component("openapi_container", OpenAPIServiceConnector(service_auth))
-    invocation_payload = create_invocation_payload(
-        base_ref=base_branch,
-        head_ref=pr_branch,
-        repository=github_repo.split("/")[0],
-        project=github_repo.split("/")[1],
-    )
+    invoke_service_pipe.connect("function_llm.replies", "openapi_container.messages")
 
-    invocation_payload = json.dumps([invocation_payload])
+    resolve_service_params_messages = [
+        ChatMessage.from_system("You are a helpful assistant capable of function calling."),
+        ChatMessage.from_user(function_model_prompt),
+    ]
+
+    tools_param = [{"type": "function", "function": openai_functions_definition}]
+    tool_choice = {"type": "function", "function": {"name": openai_functions_definition["name"]}}
+
     service_response = invoke_service_pipe.run(
-        data={"messages": [ChatMessage.from_assistant(invocation_payload)], "service_openapi_spec": openapi_spec}
+        data={
+            "messages": resolve_service_params_messages,
+            "generation_kwargs": {"tools": tools_param, "tool_choice": tool_choice},
+            "service_openapi_spec": open_api_service_spec_as_json,
+        }
     )
 
-    github_service_response: List[ChatMessage] = service_response["openapi_container"]["service_response"]
-    github_service_response_json = json.loads(github_service_response[0].content)
-    # take the diff files portion of the response to save tokens and to fit into the smaller LLM context windows
-    # other parts of the response are not relevant for PR text generation
-    # and only waste token$ and LLM context window
-    diff_message = ChatMessage.from_user(json.dumps(github_service_response_json["files"]))
+    service_response_msgs: List[ChatMessage] = service_response["openapi_container"]["service_response"]
+    service_response_json = json.loads(service_response_msgs[0].content)
+    service_response_json = (
+        service_response_json[service_response_root] if service_response_root else service_response_json
+    )
+    diff_message = ChatMessage.from_user(json.dumps(service_response_json))
 
     system_message = ChatMessage.from_system(system_prompt_text)
     if custom_instruction:
-        github_pr_prompt_messages = [system_message] + [diff_message] + [ChatMessage.from_user(custom_instruction)]
+        text_gen_prompt_messages = [system_message] + [diff_message] + [ChatMessage.from_user(custom_instruction)]
     else:
-        github_pr_prompt_messages = [system_message] + [diff_message]
+        text_gen_prompt_messages = [system_message] + [diff_message]
 
-    gen_pr_text_pipeline = Pipeline()
-    # empirically, max_tokens 2560 is enough to generate a PR text
+    gen_text_pipeline = Pipeline()
+    # TODO: perhaps provide env var for max_tokens, 2560 should be enough for many cases
     # Note that you can use OPENAI_ORG_ID to set the organization ID for your OpenAI API key to track usage and costs
-    llm = OpenAIChatGenerator(model=model_name, generation_kwargs={"max_tokens": 2560})
-    gen_pr_text_pipeline.add_component("llm", llm)
+    llm = OpenAIChatGenerator(model=text_model, generation_kwargs={"max_tokens": 2560})
+    gen_text_pipeline.add_component("llm", llm)
 
-    final_result = gen_pr_text_pipeline.run(data={"messages": github_pr_prompt_messages})
+    final_result = gen_text_pipeline.run(data={"messages": text_gen_prompt_messages})
     return final_result["llm"]["replies"][0]
 
 
@@ -126,107 +225,95 @@ def extract_custom_instruction(bot_name: str, user_instruction: str) -> str:
     return match.group(1) if match else ""
 
 
-def create_invocation_payload(base_ref: str, head_ref: str, repository: str, project: str):
-    """
-    Creates an invocation payload for the GitHub compare service.
-    :param base_ref: A string containing the base branch of the PR e.g. 'main'.
-    :param head_ref: A string containing the PR branch.
-    :param repository: A string containing the GitHub repository owner e.g. 'deepset-ai'.
-    :param project: A string containing the GitHub repository name e.g. 'haystack'.
-    :return: A dictionary containing the invocation payload.
-    """
-    invocation_payload = {
-        "id": "some_irrelevant_id",
-        "function": {
-            "arguments": f'{{"parameters": {{"basehead": "{base_ref}...{head_ref}", '
-            f'"owner": "{repository}", "repo": "{project}"}}}}',
-            "name": "compare_branches",
-        },
-        "type": "function",
-    }
-    return invocation_payload
-
-
 def contains_skip_instruction(text):
     return bool(re.search(r"\bskip\b", text, re.IGNORECASE))
 
 
-def write_to_github_output(output_name: str, output_value: str):
+def write_to_output(file_handle: str, json_input: str):
     """
-    Writes the output_name and output_value pair to the GITHUB_OUTPUT file in the format expected by GitHub Actions.
-    :param output_name: The name of the output.
-    :param output_value: The value of the output.
+     Writes the contents of a JSON object to a file, formatted for compatibility with GitHub Actions. This function
+     is specifically designed to handle the 'outputs' key within the JSON object and write each output value to the
+     specified file. It ensures that multiline outputs are handled correctly, as GitHub Actions does not support
+     multiline strings in outputs directly.
+
+    :param str file_handle: The file path or handle where the output is to be written.
+    :param str json_input: A JSON string containing the outputs to be written to the file.
     """
 
-    # needed because by default multiple lines outputs are not supported in GitHub Actions
+    # multiple lines outputs are not supported in GitHub Actions
     # see https://docs.github.com/en/actions/using-workflows/workflow-commands-for-github-actions#multiline-strings
-    hash_object = hashlib.sha256("some_random_data".encode())
-    delimiter = hash_object.hexdigest()
+    delimiter = hashlib.sha256(str(time.time()).encode()).hexdigest()[:8]
 
-    github_env = os.environ.get("GITHUB_OUTPUT", None)
-
-    if github_env:
-        # Write to the GITHUB_OUTPUT file only if we are running in GitHub Actions
-        with open(github_env, "a") as env_file:
+    # iterate over "outputs" key in the JSON object and write each output to file
+    json_object = json.loads(json_input)
+    for output_name, output_value in json_object["outputs"].items():
+        with open(file_handle, "a") as env_file:
             env_file.write(f"{output_name}<<{delimiter}\n")
             env_file.write(f"{output_value}\n")
             env_file.write(f"{delimiter}\n")
 
 
+def post_process(message: ChatMessage):
+    """
+    Post-processes the generated message to remove the JSON formatting, if any.
+
+    :param message: The generated message to be post-processed.
+    :type message: ChatMessage
+    """
+    message.content = message.content.replace("`json", "").replace("`", "").strip()
+    return message
+
+
 if __name__ == "__main__":
-    required_env_vars = {
-        "GITHUB_TOKEN": "Please provide GITHUB_TOKEN as environment variable.",
-        "OPENAI_API_KEY": "Please set OPENAI_API_KEY environment variable to your OpenAI API key.",
-    }
+    # make sure we have the required environment variables
+    get_env_var_or_default(env_var_name="OPENAI_API_KEY", required=True)
+    load_ok, open_api_spec = load_text_from(
+        [get_env_var_or_default(env_var_name="OPENAPI_SERVICE_SPEC", required=True)]
+    )
+    if not load_ok:
+        print("Exiting, failed to load OpenAPI service specification.")
+        sys.exit(0)
+    load_ok, system_prompt_text = load_text_from([get_env_var_or_default(env_var_name="SYSTEM_PROMPT", required=True)])
+    if not load_ok:
+        print("Exiting, failed to load system prompt text.")
+        sys.exit(0)
+    function_calling_prompt = get_env_var_or_default(env_var_name="FUNCTION_CALLING_PROMPT", required=True)
 
-    # account for the bot name being set to "" or None, use default value if not set
-    env_var_tmp = os.environ.get("AUTO_PR_WRITER_BOT_NAME")
-    bot_name = "auto-pr-writer-bot" if not env_var_tmp else env_var_tmp
+    # and the optional ones
+    text_generation_model_name = get_env_var_or_default(
+        env_var_name="TEXT_GENERATION_MODEL", default_value="gpt-4-1106-preview"
+    )
+    function_calling_model_name = get_env_var_or_default(
+        env_var_name="FUNCTION_CALLING_MODEL", default_value="gpt-3.5-turbo-0613"
+    )
+    output_file = get_env_var_or_default(env_var_name="OUTPUT_FILE", default_value="GITHUB_OUTPUT")
+    bot_name = get_env_var_or_default(env_var_name="BOT_NAME")
+    service_token = get_env_var_or_default(env_var_name="OPENAPI_SERVICE_TOKEN")
+    user_prompt = get_env_var_or_default(env_var_name="USER_PROMPT")
+    _, user_prompt = load_text_from([user_prompt]) if user_prompt else (False, None)
+    service_response_subtree = get_env_var_or_default(env_var_name="SERVICE_RESPONSE_SUBTREE")
+    user_instruction = extract_custom_instruction(bot_name, user_prompt) if user_prompt and bot_name else None
 
-    for var, msg in required_env_vars.items():
-        if not os.environ.get(var):
-            print(msg)
-            sys.exit(1)
-
-    user_message = os.environ.get("AUTO_PR_WRITER_USER_MESSAGE")
-    custom_user_instruction = extract_custom_instruction(bot_name, user_message) if user_message else None
-
-    if custom_user_instruction and contains_skip_instruction(custom_user_instruction):
-        print("Exiting auto-pr-writer, user instruction contains the word 'skip'.")
+    if user_instruction and contains_skip_instruction(user_instruction):
+        print("Exiting, user prompt contains the word 'skip'.")
         sys.exit(0)
 
-    # Fetch required information from environment variables or command-line arguments
-    if len(sys.argv) < 2:
-        github_repository, base_ref, head_ref = (
-            os.environ.get(var) for var in ["GITHUB_REPOSITORY", "BASE_REF", "HEAD_REF"]
-        )
-    else:
-        github_repository, base_ref, head_ref = sys.argv[1:4]
-
-    # Validate required parameters
-    if not all([github_repository, base_ref, head_ref]):
-        print(
-            "Please provide GITHUB_REPOSITORY, BASE_REF, HEAD_REF as environment variables or command-line arguments."
-        )
-        sys.exit(1)
-
-    # Ok, we are gtg, generate PR text
-    generated_pr_text_message = generate_pr_text(
-        github_repo=github_repository,
-        base_branch=base_ref,
-        pr_branch=head_ref,
-        model_name=os.environ.get("GENERATION_MODEL") or "gpt-4-1106-preview",  # long context, change with caution
-        custom_instruction=custom_user_instruction,
+    # Ok, we are gtg, generate text
+    generated_message = text_generate(
+        text_model=text_generation_model_name,
+        function_model=function_calling_model_name,
+        function_model_prompt=function_calling_prompt,
+        open_api_service_spec=open_api_spec,
+        service_response_root=service_response_subtree,
+        custom_instruction=user_instruction,
     )
-    generated_pr_text = generated_pr_text_message.content
 
-    attribution_message = os.environ.get("AUTO_PR_WRITER_ATTRIBUTION_MESSAGE")
-    if attribution_message:
-        generated_pr_text = f"{generated_pr_text}\n\n{attribution_message}"
+    generated_message = post_process(generated_message)
+    meta_info = '{"outputs":{"generation_stats":' + json.dumps(generated_message.meta) + '}}'
 
-    # output the generated PR text and the generation statistics to the console (i.e. for docker experiments)
-    print(f"{generated_pr_text}\n\n{generated_pr_text_message.meta}")
+    # output the generated text and the generation statistics to the console (i.e. for docker experiments)
+    print(f"{generated_message.content}\n{meta_info}")
 
-    # write the generated PR text and the generation statistics to the GITHUB_OUTPUT file
-    write_to_github_output("generated_pr_text", generated_pr_text)
-    write_to_github_output("generated_pr_text_stats", str(generated_pr_text_message.meta))
+    # write the output to file as JSON, each output has single outputs JSON key
+    write_to_output(output_file, generated_message.content)
+    write_to_output(output_file, meta_info)
