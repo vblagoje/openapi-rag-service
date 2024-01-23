@@ -1,0 +1,7 @@
+# add haystack-ai if you want to develop main.py
+# haystack-ai
+
+# below are runtime dependencies we'll add to base haystack image
+# these are optional dependencies needed for openapi integration
+openapi3
+jsonref
