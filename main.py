@@ -155,8 +155,10 @@ def text_generate(
     service_title = open_api_service_spec_as_json["info"]["title"]
     if has_authentication_method(open_api_service_spec_as_json):
         if not service_token:
-            raise ValueError(f"Service {service_title} requires authorization token. "
-                             f"Please set OPENAPI_SERVICE_TOKEN environment variable.")
+            raise ValueError(
+                f"Service {service_title} requires authorization token. "
+                f"Please set OPENAPI_SERVICE_TOKEN environment variable."
+            )
         else:
             service_auth = {service_title: service_token}
     else:
@@ -242,10 +244,27 @@ def write_to_output(file_handle: str, json_input: str):
 
     # multiple lines outputs are not supported in GitHub Actions
     # see https://docs.github.com/en/actions/using-workflows/workflow-commands-for-github-actions#multiline-strings
+    # therefore, we need to use a unique delimiter to mark the output boundaries
     delimiter = hashlib.sha256(str(time.time()).encode()).hexdigest()[:8]
 
     # iterate over "outputs" key in the JSON object and write each output to file
-    json_object = json.loads(json_input)
+    try:
+        json_object = json.loads(json_input)
+    except Exception:
+        logging.error(f"LLM failed to generate well formed JSON response: {json_input}")
+        logging.warning(f"Skipping writing the JSON response to file: {file_handle}")
+        return
+
+    if "outputs" not in json_object:
+        logging.warning(f"LLM failed to generate JSON response with the expected 'outputs' key: {json_input}")
+        logging.warning(f"Writing the entire JSON response to file: {file_handle}")
+
+        with open(file_handle, "a") as env_file:
+            for key, value in json_object.items():
+                env_file.write(f"{key}<<{delimiter}\n")
+                env_file.write(f"{value}\n")
+                env_file.write(f"{delimiter}\n")
+
     for output_name, output_value in json_object["outputs"].items():
         with open(file_handle, "a") as env_file:
             env_file.write(f"{output_name}<<{delimiter}\n")
@@ -253,14 +272,38 @@ def write_to_output(file_handle: str, json_input: str):
             env_file.write(f"{delimiter}\n")
 
 
-def post_process(message: ChatMessage):
+def is_valid_json(json_string: str) -> bool:
     """
-    Post-processes the generated message to remove the JSON formatting, if any.
+    Checks if a string is a valid JSON object.
+    :param json_string: a string representing a JSON object
+    :return: True if the string is a valid JSON object; otherwise, False.
+    """
+    try:
+        json_object = json.loads(json_string)
+        return isinstance(json_object, dict)
+    except Exception:
+        return False
 
+
+def post_process(message: ChatMessage, output_json_key: str) -> ChatMessage:
+    """
+    Post-processes the generated message
     :param message: The generated message to be post-processed.
     :type message: ChatMessage
+    :param output_json_key: The key to use for the output of the generated message.
+    :type output_json_key: str
     """
-    message.content = message.content.replace("`json", "").replace("`", "").strip()
+    if not is_valid_json(message.content):
+        resp = message.content
+        # remove various ```code or ```json code callouts LLMs may generate
+        resp = resp.replace("`", "").replace("`", "").strip()
+        resp = resp.replace("code", "").strip()
+        resp = resp.replace("json", "").strip()
+        resp = resp.replace("markdown", "").strip()
+
+        # call json.dumps to remove all characters that are not valid JSON,
+        # dump the response into a JSON object under predefined key
+        message.content = '{"outputs":{"' + output_json_key + '":' + json.dumps(resp) + "}}"
     return message
 
 
@@ -287,6 +330,7 @@ if __name__ == "__main__":
         env_var_name="FUNCTION_CALLING_MODEL", default_value="gpt-3.5-turbo-0613"
     )
     output_file = get_env_var_or_default(env_var_name="OUTPUT_FILE", default_value="GITHUB_OUTPUT")
+    output_key = get_env_var_or_default(env_var_name="OUTPUT_KEY", default_value="output")
     bot_name = get_env_var_or_default(env_var_name="BOT_NAME")
     service_token = get_env_var_or_default(env_var_name="OPENAPI_SERVICE_TOKEN")
     user_prompt = get_env_var_or_default(env_var_name="USER_PROMPT")
@@ -308,8 +352,8 @@ if __name__ == "__main__":
         custom_instruction=user_instruction,
     )
 
-    generated_message = post_process(generated_message)
-    meta_info = '{"outputs":{"generation_stats":' + json.dumps(generated_message.meta) + '}}'
+    generated_message = post_process(generated_message, output_key)
+    meta_info = '{"outputs":{"generation_stats":' + json.dumps(generated_message.meta) + "}}"
 
     # output the generated text and the generation statistics to the console (i.e. for docker experiments)
     print(f"{generated_message.content}\n{meta_info}")
