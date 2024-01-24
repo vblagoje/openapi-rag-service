@@ -244,8 +244,7 @@ def write_to_output(file_handle: str, json_input: str):
 
     # multiple lines outputs are not supported in GitHub Actions
     # see https://docs.github.com/en/actions/using-workflows/workflow-commands-for-github-actions#multiline-strings
-    # therefore, we need to use a unique delimiter to mark the output boundaries
-    delimiter = hashlib.sha256(str(time.time()).encode()).hexdigest()[:8]
+    # therefore, we need to use a unique delimiter to mark the output boundaries of each output
 
     # iterate over "outputs" key in the JSON object and write each output to file
     try:
@@ -261,12 +260,14 @@ def write_to_output(file_handle: str, json_input: str):
 
         with open(file_handle, "a") as env_file:
             for key, value in json_object.items():
+                delimiter = hashlib.sha256(str(time.time()).encode()).hexdigest()[:8]
                 env_file.write(f"{key}<<{delimiter}\n")
                 env_file.write(f"{value}\n")
                 env_file.write(f"{delimiter}\n")
 
     for output_name, output_value in json_object["outputs"].items():
         with open(file_handle, "a") as env_file:
+            delimiter = hashlib.sha256(str(time.time()).encode()).hexdigest()[:8]
             env_file.write(f"{output_name}<<{delimiter}\n")
             env_file.write(f"{output_value}\n")
             env_file.write(f"{delimiter}\n")
@@ -285,6 +286,19 @@ def is_valid_json(json_string: str) -> bool:
         return False
 
 
+def remove_outer_callouts(text: str):
+    text = text.strip()
+
+    # Check if the text starts with and ends with callouts
+    if text.startswith("```") and text.endswith("```"):
+        first_newline = text.find('\n') + 1
+        last_callout_start = text.rfind("```")
+        # Slice the text to remove the first and last callouts
+        return text[first_newline:last_callout_start].strip()
+    else:
+        return text
+
+
 def post_process(message: ChatMessage, output_json_key: str) -> ChatMessage:
     """
     Post-processes the generated message
@@ -294,14 +308,9 @@ def post_process(message: ChatMessage, output_json_key: str) -> ChatMessage:
     :type output_json_key: str
     """
     if not is_valid_json(message.content):
-        resp = message.content
-        # remove various ```code or ```json code callouts LLMs may generate
-        resp = resp.replace("`", "").replace("`", "").strip()
-        resp = resp.replace("code", "").strip()
-        resp = resp.replace("json", "").strip()
-        resp = resp.replace("markdown", "").strip()
 
-        # call json.dumps to remove all characters that are not valid JSON,
+        # Remove the outermost callouts (if any) as LLMs may add them
+        resp = remove_outer_callouts(message.content)
         # dump the response into a JSON object under predefined key
         message.content = '{"outputs":{"' + output_json_key + '":' + json.dumps(resp) + "}}"
     return message
