@@ -11,6 +11,7 @@ from urllib.parse import urlparse
 
 import requests
 from haystack import Pipeline
+from haystack.components.builders import PromptBuilder
 from haystack.components.connectors import OpenAPIServiceConnector
 from haystack.components.converters import OpenAPIServiceToFunctions
 from haystack.components.generators.chat import OpenAIChatGenerator
@@ -253,21 +254,15 @@ def write_to_output(file_handle: str, json_input: str):
         logging.error(f"LLM failed to generate well formed JSON response: {json_input}")
         logging.warning(f"Skipping writing the JSON response to file: {file_handle}")
         return
-
-    if "outputs" not in json_object:
-        logging.warning(f"LLM failed to generate JSON response with the expected 'outputs' key: {json_input}")
-        logging.warning(f"Writing the entire JSON response to file: {file_handle}")
-
-        with open(file_handle, "a") as env_file:
-            for key, value in json_object.items():
-                delimiter = hashlib.sha256(str(time.time()).encode()).hexdigest()[:8]
-                env_file.write(f"{key}<<{delimiter}\n")
-                env_file.write(f"{value}\n")
-                env_file.write(f"{delimiter}\n")
-
-    for output_name, output_value in json_object["outputs"].items():
+    for output_name, output_value in json_object.items():
         with open(file_handle, "a") as env_file:
             delimiter = hashlib.sha256(str(time.time()).encode()).hexdigest()[:8]
+            # lookup if we have any jinja template registered under the env var + _TEMPLATE name
+            template_name = get_env_var_or_default(env_var_name=str(output_name).upper() + "_TEMPLATE")
+            if template_name:
+                pb = PromptBuilder(template=template_name)
+                output_value = pb.run(**output_value)["prompt"]
+
             env_file.write(f"{output_name}<<{delimiter}\n")
             env_file.write(f"{output_value}\n")
             env_file.write(f"{delimiter}\n")
@@ -286,12 +281,35 @@ def is_valid_json(json_string: str) -> bool:
         return False
 
 
-def remove_outer_callouts(text: str):
+def json_format_llm_output(llm_output_schema: str, message: ChatMessage):
+    """
+    Formats the output of the LLM to match the schema of the OpenAI function definition.
+    :param llm_output_schema: The OpenAI function calling schema to constrain the output of the generated message.
+    :type llm_output_schema: str
+    :param message: The generated message to be formatted.
+    :type message: ChatMessage
+    :return: message with the output formatted to match the schema of the OpenAI function definition.
+    """
+    output_schema_json = json.loads(llm_output_schema)
+    format_to_json_message = [ChatMessage.from_user(message.content)]
+    chat_gen = OpenAIChatGenerator(model="gpt-3.5-turbo-0613")
+    tools_param = [{"type": "function", "function": output_schema_json}]
+    tool_choice = {"type": "function", "function": {"name": output_schema_json["name"]}}
+    fc_response = chat_gen.run(
+        format_to_json_message, generation_kwargs={"tools": tools_param, "tool_choice": tool_choice}
+    )
+    message_response = fc_response["replies"][0]
+    payload = json.loads(message_response.content)
+    message.content = payload[0]["function"]["arguments"]
+    return message
+
+
+def remove_outer_code_blocks(text: str):
     text = text.strip()
 
     # Check if the text starts with and ends with callouts
     if text.startswith("```") and text.endswith("```"):
-        first_newline = text.find('\n') + 1
+        first_newline = text.find("\n") + 1
         last_callout_start = text.rfind("```")
         # Slice the text to remove the first and last callouts
         return text[first_newline:last_callout_start].strip()
@@ -299,20 +317,25 @@ def remove_outer_callouts(text: str):
         return text
 
 
-def post_process(message: ChatMessage, output_json_key: str) -> ChatMessage:
+def post_process(message: ChatMessage, output_json_key: str, llm_output_schema: str) -> ChatMessage:
     """
     Post-processes the generated message
     :param message: The generated message to be post-processed.
     :type message: ChatMessage
     :param output_json_key: The key to use for the output of the generated message.
     :type output_json_key: str
+    :param llm_output_schema: The OpenAI function calling schema to constrain the output of the generated message.
+    :type llm_output_schema: str
+    :return: The post-processed message.
     """
     if not is_valid_json(message.content):
+        # Attempt to remove the outermost code block and check for valid JSON again
+        resp = remove_outer_code_blocks(message.content)
+        message.content = json.dumps({output_json_key: resp}) if not is_valid_json(resp) else resp
 
-        # Remove the outermost callouts (if any) as LLMs may add them
-        resp = remove_outer_callouts(message.content)
-        # dump the response into a JSON object under predefined key
-        message.content = '{"outputs":{"' + output_json_key + '":' + json.dumps(resp) + "}}"
+    if llm_output_schema:
+        message = json_format_llm_output(llm_output_schema, message)
+
     return message
 
 
@@ -331,7 +354,7 @@ if __name__ == "__main__":
         sys.exit(0)
     function_calling_prompt = get_env_var_or_default(env_var_name="FUNCTION_CALLING_PROMPT", required=True)
 
-    # and the optional ones
+    # and the optional environment variables
     text_generation_model_name = get_env_var_or_default(
         env_var_name="TEXT_GENERATION_MODEL", default_value="gpt-4-1106-preview"
     )
@@ -339,7 +362,8 @@ if __name__ == "__main__":
         env_var_name="FUNCTION_CALLING_MODEL", default_value="gpt-3.5-turbo-0613"
     )
     output_file = get_env_var_or_default(env_var_name="OUTPUT_FILE", default_value="GITHUB_OUTPUT")
-    output_key = get_env_var_or_default(env_var_name="OUTPUT_KEY", default_value="output")
+    output_key = get_env_var_or_default(env_var_name="OUTPUT_KEY", default_value="text_generation")
+    output_schema = get_env_var_or_default(env_var_name="OUTPUT_SCHEMA")
     bot_name = get_env_var_or_default(env_var_name="BOT_NAME")
     service_token = get_env_var_or_default(env_var_name="OPENAPI_SERVICE_TOKEN")
     user_prompt = get_env_var_or_default(env_var_name="USER_PROMPT")
@@ -361,12 +385,11 @@ if __name__ == "__main__":
         custom_instruction=user_instruction,
     )
 
-    generated_message = post_process(generated_message, output_key)
-    meta_info = '{"outputs":{"generation_stats":' + json.dumps(generated_message.meta) + "}}"
+    generated_message = post_process(generated_message, output_key, output_schema)
+    meta_info = json.dumps({"text_generation_stats": generated_message.meta})
 
     # output the generated text and the generation statistics to the console (i.e. for docker experiments)
     print(f"{generated_message.content}\n{meta_info}")
 
-    # write the output to file as JSON, each output has single outputs JSON key
     write_to_output(output_file, generated_message.content)
     write_to_output(output_file, meta_info)
