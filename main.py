@@ -363,6 +363,7 @@ if __name__ == "__main__":
         env_var_name="FUNCTION_CALLING_MODEL", default_value="gpt-3.5-turbo-0613"
     )
     output_file = get_env_var_or_default(env_var_name="OUTPUT_FILE", default_value="GITHUB_OUTPUT")
+    _, output_file = load_text_from([output_file]) if output_file else (False, None)
     output_key = get_env_var_or_default(env_var_name="OUTPUT_KEY", default_value="text_generation")
     output_schema = get_env_var_or_default(env_var_name="OUTPUT_SCHEMA")
     _, output_schema = load_text_from([output_schema]) if output_schema else (False, None)
