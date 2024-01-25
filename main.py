@@ -259,8 +259,9 @@ def write_to_output(file_handle: str, json_input: str):
             delimiter = hashlib.sha256(str(time.time()).encode()).hexdigest()[:8]
             # lookup if we have any jinja template registered under the env var + _TEMPLATE name
             template_name = get_env_var_or_default(env_var_name=str(output_name).upper() + "_TEMPLATE")
-            if template_name:
-                pb = PromptBuilder(template=template_name)
+            _, template = load_text_from([template_name]) if template_name else (False, None)
+            if template:
+                pb = PromptBuilder(template=template)
                 output_value = pb.run(**output_value)["prompt"]
 
             env_file.write(f"{output_name}<<{delimiter}\n")
