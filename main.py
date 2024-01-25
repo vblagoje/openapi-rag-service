@@ -364,6 +364,7 @@ if __name__ == "__main__":
     output_file = get_env_var_or_default(env_var_name="OUTPUT_FILE", default_value="GITHUB_OUTPUT")
     output_key = get_env_var_or_default(env_var_name="OUTPUT_KEY", default_value="text_generation")
     output_schema = get_env_var_or_default(env_var_name="OUTPUT_SCHEMA")
+    _, output_schema = load_text_from([output_schema]) if output_schema else (False, None)
     bot_name = get_env_var_or_default(env_var_name="BOT_NAME")
     service_token = get_env_var_or_default(env_var_name="OPENAPI_SERVICE_TOKEN")
     user_prompt = get_env_var_or_default(env_var_name="USER_PROMPT")
