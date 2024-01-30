@@ -1,7 +1,6 @@
 import contextlib
 import dataclasses
 import hashlib
-import itertools
 import json
 import logging
 import os
@@ -19,11 +18,13 @@ from haystack import component
 from haystack.components.connectors import OpenAPIServiceConnector
 from haystack.components.converters import OpenAPIServiceToFunctions
 from haystack.components.generators.chat import OpenAIChatGenerator
+from haystack.components.others import Multiplexer
 from haystack.components.routers import ConditionalRouter
-from haystack.core.component.types import Variadic
 from haystack.dataclasses import ByteStream
 from haystack.dataclasses import ChatMessage
 from jinja2 import Template
+from jsonschema.exceptions import ValidationError
+from jsonschema.validators import validate
 from openai import OpenAI
 from openai.types.chat import ChatCompletion, ChatCompletionMessage
 
@@ -50,8 +51,12 @@ def ensure_json_objects(data):
     :param data: The dictionary to be traversed and modified.
     :return: The modified dictionary with JSON strings converted to dictionary objects.
     """
+    if isinstance(data, list):
+        # If data is a list, recursively process each element
+        return [ensure_json_objects(item) for item in data]
+
     if not isinstance(data, dict):
-        raise ValueError("Input must be a dictionary.")
+        raise ValueError("Input must be a dictionary or a list of dictionaries.")
 
     for key, value in data.items():
         if isinstance(value, str):
@@ -75,7 +80,7 @@ def ensure_json_objects(data):
 
 
 def get_env_var_or_default(
-        env_var_name: str, default_value: Optional[Any] = None, required: bool = False
+    env_var_name: str, default_value: Optional[Any] = None, required: bool = False
 ) -> Optional[str]:
     """
     Retrieves the value of an environment variable if it exists, otherwise returns a default value or raises an
@@ -97,6 +102,7 @@ def get_env_var_or_default(
         return default_value
     if required:
         raise ValueError(f"The required environment variable '{env_var_name}' is not set.")
+    return None
 
 
 def is_valid_url(location: str):
@@ -240,6 +246,62 @@ class FormattedOutputTarget:
                 raise
         else:
             return contextlib.nullcontext(self.destination)
+
+
+@component
+class SchemaValidator:
+    """
+    SchemaValidator as its name implies validates if the last message conforms to provided json schema.
+    """
+
+    @component.output_types(validated=List[ChatMessage], validation_error=List[ChatMessage])
+    def run(
+        self,
+        messages: List[ChatMessage],
+        json_schema: Dict[str, Any],
+        previous_messages: Optional[List[ChatMessage]] = None,
+    ):
+        """
+        Checks if the last message and its content field conforms to json_schema.
+
+        :param messages: A list of ChatMessage instances to be validated.
+        :param previous_messages: A list of previous ChatMessage instances.
+        :param json_schema: A JSON schema string against which the content is validated.
+        """
+        last_message = messages[-1]
+        message_content = json.loads(last_message.content)
+        message_json = ensure_json_objects(message_content)
+        try:
+            if isinstance(message_json, list):
+                for content in message_json:
+                    validate(instance=content, schema=json_schema)
+            else:
+                validate(instance=message_content, schema=json_schema)
+
+            return {"validated": messages}
+        except ValidationError as e:
+            error_path = " -> ".join(map(str, e.absolute_path)) if e.absolute_path else "N/A"
+            error_schema_path = " -> ".join(map(str, e.absolute_schema_path)) if e.absolute_schema_path else "N/A"
+
+            recovery_prompt = self.construct_error_recovery_message(
+                e.message, error_path, error_schema_path, json_schema
+            )
+            previous_messages = previous_messages or []
+            complete_message_list = previous_messages + messages + [ChatMessage.from_user(recovery_prompt)]
+
+            return {"validation_error": complete_message_list}
+
+    def construct_error_recovery_message(
+        self, error_message: str, error_path: str, error_schema_path: str, json_schema: Dict[str, Any]
+    ) -> str:
+        recovery_prompt = (
+            f"The JSON content in the previous message does not conform to the expected schema. "
+            f"Error details:\n- Message: {error_message}\n- Error Path in JSON: {error_path}\n"
+            f"- Schema Path: {error_schema_path}\n"
+            "Please review the JSON content and modify it to match the following schema requirements:\n"
+            f"{json.dumps(json_schema, indent=2)}\n"
+        )
+        return recovery_prompt
 
 
 @component
@@ -447,16 +509,16 @@ class FormattedOutputProcessor:
     """
 
     @component.output_types(output=List[Dict[str, Any]])
-    def run(self, json_objects: Variadic[List[Dict[str, Any]]], output_targets: List[FormattedOutputTarget]):
+    def run(self, json_objects: List[Dict[str, Any]], output_targets: List[FormattedOutputTarget]):
         """
         Iterates over a collection of JSON objects and output targets, writing each JSON object
         to the specified targets with appropriate formatting.
 
-        :param json_objects: A nested list of JSON objects to be processed and written to the output targets.
+        :param json_objects: A list of JSON objects to be processed and written to the output targets.
         :param output_targets: A list of FormattedOutputTarget instances specifying where and how to write the outputs.
         :return: A dictionary containing the processed JSON objects under the key 'output'.
         """
-        for json_object in itertools.chain(*json_objects):
+        for json_object in json_objects:
             for output_target in output_targets:
                 self.write_formatted_output(json_object, output_target)
 
@@ -535,6 +597,9 @@ if __name__ == "__main__":
     function_calling_model_name = get_env_var_or_default(
         env_var_name="FUNCTION_CALLING_MODEL", default_value="gpt-3.5-turbo-0613"
     )
+    fc_json_schema = get_env_var_or_default(env_var_name="FC_JSON_SCHEMA")
+    fc_json_schema = fetch_content_from([fc_json_schema]) if fc_json_schema else None
+    fc_json_schema = json.loads(fc_json_schema) if fc_json_schema else None
     github_output_file = get_env_var_or_default(env_var_name="GITHUB_OUTPUT")
     output_key = get_env_var_or_default(env_var_name="OUTPUT_KEY", default_value="text_generation")
     output_schema = get_env_var_or_default(env_var_name="OUTPUT_SCHEMA")
@@ -571,10 +636,35 @@ if __name__ == "__main__":
     else:
         service_auth = None
 
+    routes = [
+        {
+            "condition": "{{fc_json_schema}}",
+            "output": "{{messages}}",
+            "output_name": "with_error_correction",
+            "output_type": List[ChatMessage],
+        },
+        {
+            "condition": "{{not fc_json_schema}}",
+            "output": "{{messages}}",
+            "output_name": "no_error_correction",
+            "output_type": List[ChatMessage],
+        },
+    ]
+    fc_error_handling = ConditionalRouter(routes)
     invoke_service_pipe = Pipeline()
+    invoke_service_pipe.add_component("mx_function_llm", Multiplexer(List[ChatMessage]))
+    invoke_service_pipe.add_component("mx_openapi_container", Multiplexer(List[ChatMessage]))
     invoke_service_pipe.add_component("function_llm", OpenAIChatGenerator(model=function_calling_model_name))
+    invoke_service_pipe.add_component("router", fc_error_handling)
+    invoke_service_pipe.add_component("schema_validator", SchemaValidator())
     invoke_service_pipe.add_component("openapi_container", OpenAPIServiceConnector(service_auth))
-    invoke_service_pipe.connect("function_llm.replies", "openapi_container.messages")
+    invoke_service_pipe.connect("mx_function_llm", "function_llm.messages")
+    invoke_service_pipe.connect("function_llm.replies", "router.messages")
+    invoke_service_pipe.connect("router.with_error_correction", "schema_validator.messages")
+    invoke_service_pipe.connect("mx_openapi_container", "openapi_container.messages")
+    invoke_service_pipe.connect("router.no_error_correction", "mx_openapi_container")
+    invoke_service_pipe.connect("schema_validator.validated", "mx_openapi_container")
+    invoke_service_pipe.connect("schema_validator.validation_error", "mx_function_llm")
 
     resolve_service_params_messages = [
         ChatMessage.from_system("You are a helpful assistant capable of function calling."),
@@ -586,12 +676,13 @@ if __name__ == "__main__":
 
     service_response = invoke_service_pipe.run(
         data={
-            "messages": resolve_service_params_messages,
-            "generation_kwargs": {"tools": tools_param, "tool_choice": tool_choice},
-            "service_openapi_spec": open_api_service_spec_as_json,
+            "mx_function_llm": {"value": resolve_service_params_messages},
+            "function_llm": {"generation_kwargs": {"tools": tools_param, "tool_choice": tool_choice}},
+            "router": {"fc_json_schema": bool(fc_json_schema)},
+            "openapi_container": {"service_openapi_spec": open_api_service_spec_as_json},
+            "schema_validator": {"previous_messages": resolve_service_params_messages, "json_schema": fc_json_schema},
         }
     )
-
     service_response_msgs: List[ChatMessage] = service_response["openapi_container"]["service_response"]
     service_response_json = json.loads(service_response_msgs[0].content)
     service_response_json = (
@@ -610,13 +701,13 @@ if __name__ == "__main__":
         {
             "condition": "{{has_output_schema}}",
             "output": "{{messages}}",
-            "output_name": "needs_fc",
+            "output_name": "needs_function_calling",
             "output_type": List[ChatMessage],
         },
         {
             "condition": "{{not has_output_schema}}",
             "output": "{{messages}}",
-            "output_name": "no_fc",
+            "output_name": "no_need_for_function_calling",
             "output_type": List[ChatMessage],
         },
     ]
@@ -626,15 +717,17 @@ if __name__ == "__main__":
     )
     gen_text_pipeline.add_component("post", LLMJSONFormatEnforcer())
     gen_text_pipeline.add_component("router", ConditionalRouter(routes))
-    gen_text_pipeline.add_component("fc_llm", OpenAIJSONGenerator())
+    gen_text_pipeline.add_component("json_gen_llm", OpenAIJSONGenerator(model=function_calling_model_name))
     gen_text_pipeline.add_component("msg_to_json", ChatMessageToJSONConverter())
-    gen_text_pipeline.add_component("github_output", FormattedOutputProcessor())
+    gen_text_pipeline.add_component("mx_final_output", Multiplexer(List[Dict[str, Any]]))
+    gen_text_pipeline.add_component("final_output", FormattedOutputProcessor())
     gen_text_pipeline.connect("llm.replies", "post.messages")
     gen_text_pipeline.connect("post.messages", "router")
-    gen_text_pipeline.connect("router.needs_fc", "fc_llm.messages")
-    gen_text_pipeline.connect("router.no_fc", "msg_to_json.messages")
-    gen_text_pipeline.connect("msg_to_json.output", "github_output.json_objects")
-    gen_text_pipeline.connect("fc_llm.output", "github_output.json_objects")
+    gen_text_pipeline.connect("router.needs_function_calling", "json_gen_llm.messages")
+    gen_text_pipeline.connect("router.no_need_for_function_calling", "msg_to_json.messages")
+    gen_text_pipeline.connect("msg_to_json.output", "mx_final_output")
+    gen_text_pipeline.connect("json_gen_llm.output", "mx_final_output")
+    gen_text_pipeline.connect("mx_final_output", "final_output.json_objects")
 
     output_sinks = [FormattedOutputTarget(github_output_file, GITHUB_OUTPUT_TEMPLATE)] if github_output_file else []
     # always output to stdout for debugging unless quiet mode is enabled
