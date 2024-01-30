@@ -5,3 +5,4 @@
 # these are optional dependencies needed for openapi integration
 openapi3
 jsonref
+jsonschema
