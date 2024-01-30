@@ -597,7 +597,7 @@ if __name__ == "__main__":
     function_calling_model_name = get_env_var_or_default(
         env_var_name="FUNCTION_CALLING_MODEL", default_value="gpt-3.5-turbo-0613"
     )
-    fc_json_schema = get_env_var_or_default(env_var_name="FC_JSON_SCHEMA")
+    fc_json_schema = get_env_var_or_default(env_var_name="FUNCTION_CALLING_VALIDATION_SCHEMA")
     fc_json_schema = fetch_content_from([fc_json_schema]) if fc_json_schema else None
     fc_json_schema = json.loads(fc_json_schema) if fc_json_schema else None
     github_output_file = get_env_var_or_default(env_var_name="GITHUB_OUTPUT")
@@ -661,8 +661,8 @@ if __name__ == "__main__":
     invoke_service_pipe.connect("mx_function_llm", "function_llm.messages")
     invoke_service_pipe.connect("function_llm.replies", "router.messages")
     invoke_service_pipe.connect("router.with_error_correction", "schema_validator.messages")
-    invoke_service_pipe.connect("mx_openapi_container", "openapi_container.messages")
     invoke_service_pipe.connect("router.no_error_correction", "mx_openapi_container")
+    invoke_service_pipe.connect("mx_openapi_container", "openapi_container.messages")
     invoke_service_pipe.connect("schema_validator.validated", "mx_openapi_container")
     invoke_service_pipe.connect("schema_validator.validation_error", "mx_function_llm")
 
