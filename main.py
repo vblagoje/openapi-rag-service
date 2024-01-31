@@ -399,7 +399,7 @@ class OpenAIJSONGenerator:
         :param generation_kwargs: Optional; Additional keyword arguments for the OpenAI generation call.
         """
 
-    @component.output_types(output=List[Dict[str, Any]])
+    @component.output_types(output=List[ChatMessage])
     def run(self, messages: List[ChatMessage], output_schema: str):
         """
         Generates JSON responses based on the given ChatMessages and the specified output schema. It sends the
@@ -418,7 +418,6 @@ class OpenAIJSONGenerator:
 
         # adapt ChatMessage(s) to the format expected by the OpenAI API
         openai_formatted_messages = self._convert_to_openai_format(format_to_json_message)
-
         chat_completion: ChatCompletion = self.client.chat.completions.create(
             model=self.model,
             messages=openai_formatted_messages,  # type: ignore # openai expects list of specific message types
@@ -427,8 +426,8 @@ class OpenAIJSONGenerator:
         )
 
         completions: List[Dict[str, Any]] = self._build_response(chat_completion)
-        fn_calls = [ensure_json_objects(completion)["function"]["arguments"] for completion in completions]
-        return {"output": fn_calls}
+        fn_call_messages = [ChatMessage.from_assistant(completion["function"]["arguments"]) for completion in completions]
+        return {"output": fn_call_messages}
 
     def _convert_to_openai_format(self, messages: List[ChatMessage]) -> List[Dict[str, Any]]:
         """
@@ -509,15 +508,16 @@ class FormattedOutputProcessor:
     """
 
     @component.output_types(output=List[Dict[str, Any]])
-    def run(self, json_objects: List[Dict[str, Any]], output_targets: List[FormattedOutputTarget]):
+    def run(self, messages: List[ChatMessage], output_targets: List[FormattedOutputTarget]):
         """
         Iterates over a collection of JSON objects and output targets, writing each JSON object
         to the specified targets with appropriate formatting.
 
-        :param json_objects: A list of JSON objects to be processed and written to the output targets.
+        :param messages: A list of ChatMessage instances to be processed.
         :param output_targets: A list of FormattedOutputTarget instances specifying where and how to write the outputs.
         :return: A dictionary containing the processed JSON objects under the key 'output'.
         """
+        json_objects = [json.loads(message.content) for message in messages]
         for json_object in json_objects:
             for output_target in output_targets:
                 self.write_formatted_output(json_object, output_target)
@@ -718,16 +718,14 @@ if __name__ == "__main__":
     gen_text_pipeline.add_component("post", LLMJSONFormatEnforcer())
     gen_text_pipeline.add_component("router", ConditionalRouter(routes))
     gen_text_pipeline.add_component("json_gen_llm", OpenAIJSONGenerator(model=function_calling_model_name))
-    gen_text_pipeline.add_component("msg_to_json", ChatMessageToJSONConverter())
-    gen_text_pipeline.add_component("mx_final_output", Multiplexer(List[Dict[str, Any]]))
+    gen_text_pipeline.add_component("mx_final_output", Multiplexer(List[ChatMessage]))
     gen_text_pipeline.add_component("final_output", FormattedOutputProcessor())
     gen_text_pipeline.connect("llm.replies", "post.messages")
     gen_text_pipeline.connect("post.messages", "router")
     gen_text_pipeline.connect("router.needs_function_calling", "json_gen_llm.messages")
-    gen_text_pipeline.connect("router.no_need_for_function_calling", "msg_to_json.messages")
-    gen_text_pipeline.connect("msg_to_json.output", "mx_final_output")
+    gen_text_pipeline.connect("router.no_need_for_function_calling", "mx_final_output")
     gen_text_pipeline.connect("json_gen_llm.output", "mx_final_output")
-    gen_text_pipeline.connect("mx_final_output", "final_output.json_objects")
+    gen_text_pipeline.connect("mx_final_output", "final_output.messages")
 
     output_sinks = [FormattedOutputTarget(github_output_file, GITHUB_OUTPUT_TEMPLATE)] if github_output_file else []
     # always output to stdout for debugging unless quiet mode is enabled
