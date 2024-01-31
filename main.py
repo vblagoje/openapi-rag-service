@@ -269,14 +269,16 @@ class SchemaValidator:
         :param json_schema: A JSON schema string against which the content is validated.
         """
         last_message = messages[-1]
-        message_content = json.loads(last_message.content)
-        message_json = ensure_json_objects(message_content)
+        last_message_content = json.loads(last_message.content)
+        last_message_json = ensure_json_objects(last_message_content)
+        if self.is_openai_function_calling_schema(json_schema):
+            validation_schema = json_schema["parameters"]
+        else:
+            validation_schema = json_schema
         try:
-            if isinstance(message_json, list):
-                for content in message_json:
-                    validate(instance=content, schema=json_schema)
-            else:
-                validate(instance=message_content, schema=json_schema)
+            last_message_json = [last_message_json] if not isinstance(last_message_json, list) else last_message_json
+            for content in last_message_json:
+                validate(instance=content, schema=validation_schema)
 
             return {"validated": messages}
         except ValidationError as e:
@@ -284,7 +286,7 @@ class SchemaValidator:
             error_schema_path = " -> ".join(map(str, e.absolute_schema_path)) if e.absolute_schema_path else "N/A"
 
             recovery_prompt = self.construct_error_recovery_message(
-                e.message, error_path, error_schema_path, json_schema
+                e.message, error_path, error_schema_path, validation_schema
             )
             previous_messages = previous_messages or []
             complete_message_list = previous_messages + messages + [ChatMessage.from_user(recovery_prompt)]
@@ -302,6 +304,15 @@ class SchemaValidator:
             f"{json.dumps(json_schema, indent=2)}\n"
         )
         return recovery_prompt
+
+    def is_openai_function_calling_schema(self, json_schema: Dict[str, Any]) -> bool:
+        """
+        Checks if the provided schema is a valid OpenAI function calling schema.
+
+        :param json_schema: A JSON schema string against which the content is validated.
+        :return: True if the schema is a valid OpenAI function calling schema; otherwise, False.
+        """
+        return all(key in json_schema for key in ["name", "description", "parameters"])
 
 
 @component
@@ -400,16 +411,15 @@ class OpenAIJSONGenerator:
         """
 
     @component.output_types(output=List[ChatMessage])
-    def run(self, messages: List[ChatMessage], output_schema: str):
+    def run(self, messages: List[ChatMessage], output_schema_json: Dict[str, Any]):
         """
         Generates JSON responses based on the given ChatMessages and the specified output schema. It sends the
         formatted messages to the OpenAI API and processes the response according to the output schema.
 
         :param messages: A list of ChatMessage instances to process.
-        :param output_schema: A JSON string defining the schema for the output.
+        :param output_schema_json: JSON defining the schema for the output.
         :return: A dictionary containing the processed responses under the key 'output'.
         """
-        output_schema_json = json.loads(output_schema)
         format_to_json_message = [messages[-1]]
 
         tools_param = [{"type": "function", "function": output_schema_json}]
@@ -426,7 +436,9 @@ class OpenAIJSONGenerator:
         )
 
         completions: List[Dict[str, Any]] = self._build_response(chat_completion)
-        fn_call_messages = [ChatMessage.from_assistant(completion["function"]["arguments"]) for completion in completions]
+        fn_call_messages = [
+            ChatMessage.from_assistant(completion["function"]["arguments"]) for completion in completions
+        ]
         return {"output": fn_call_messages}
 
     def _convert_to_openai_format(self, messages: List[ChatMessage]) -> List[Dict[str, Any]]:
@@ -604,6 +616,7 @@ if __name__ == "__main__":
     output_key = get_env_var_or_default(env_var_name="OUTPUT_KEY", default_value="text_generation")
     output_schema = get_env_var_or_default(env_var_name="OUTPUT_SCHEMA")
     output_schema = fetch_content_from([output_schema]) if output_schema else None
+    output_schema = json.loads(output_schema) if output_schema else None
     bot_name = get_env_var_or_default(env_var_name="BOT_NAME")
     service_token = get_env_var_or_default(env_var_name="OPENAPI_SERVICE_TOKEN")
     user_prompt = get_env_var_or_default(env_var_name="USER_PROMPT")
@@ -718,13 +731,18 @@ if __name__ == "__main__":
     gen_text_pipeline.add_component("post", LLMJSONFormatEnforcer())
     gen_text_pipeline.add_component("router", ConditionalRouter(routes))
     gen_text_pipeline.add_component("json_gen_llm", OpenAIJSONGenerator(model=function_calling_model_name))
+    gen_text_pipeline.add_component("schema_validator", SchemaValidator())
     gen_text_pipeline.add_component("mx_final_output", Multiplexer(List[ChatMessage]))
+    gen_text_pipeline.add_component("mx_for_json_gen_llm", Multiplexer(List[ChatMessage]))
     gen_text_pipeline.add_component("final_output", FormattedOutputProcessor())
     gen_text_pipeline.connect("llm.replies", "post.messages")
     gen_text_pipeline.connect("post.messages", "router")
-    gen_text_pipeline.connect("router.needs_function_calling", "json_gen_llm.messages")
+    gen_text_pipeline.connect("router.needs_function_calling", "mx_for_json_gen_llm")
     gen_text_pipeline.connect("router.no_need_for_function_calling", "mx_final_output")
-    gen_text_pipeline.connect("json_gen_llm.output", "mx_final_output")
+    gen_text_pipeline.connect("json_gen_llm.output", "schema_validator.messages")
+    gen_text_pipeline.connect("schema_validator.validated", "mx_final_output")
+    gen_text_pipeline.connect("schema_validator.validation_error", "mx_for_json_gen_llm")
+    gen_text_pipeline.connect("mx_for_json_gen_llm", "json_gen_llm.messages")
     gen_text_pipeline.connect("mx_final_output", "final_output.messages")
 
     output_sinks = [FormattedOutputTarget(github_output_file, GITHUB_OUTPUT_TEMPLATE)] if github_output_file else []
@@ -737,7 +755,9 @@ if __name__ == "__main__":
             "messages": text_gen_prompt_messages,
             "has_output_schema": bool(output_schema),
             "output_key": output_key,
-            "output_schema": output_schema,
+            "output_schema_json": output_schema,
             "output_targets": output_sinks,
+            "previous_messages": text_gen_prompt_messages,
+            "json_schema": output_schema,
         }
     )
