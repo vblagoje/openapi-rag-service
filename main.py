@@ -1,4 +1,5 @@
 import contextlib
+import copy
 import dataclasses
 import hashlib
 import json
@@ -334,12 +335,15 @@ class LLMJSONFormatEnforcer:
         :param output_key: The key used to wrap the content if it's not already valid JSON.
         :return: A dictionary containing the list of messages under the key 'messages'.
         """
-        message = messages[-1]
-        if not self.is_valid_json(message.content):
+        last_message = messages[-1]
+        modified_message = copy.deepcopy(last_message)
+        if not self.is_valid_json(modified_message.content):
             # Attempt to remove the outermost code block and check for valid JSON again
-            resp = self.remove_outer_code_blocks(message.content)
-            message.content = json.dumps({output_key: resp}) if not self.is_valid_json(resp) else resp
+            resp = self.remove_outer_code_blocks(modified_message.content)
+            modified_message.content = json.dumps({output_key: resp}) if not self.is_valid_json(resp) else resp
 
+        # Replace the last message with the modified copy
+        messages[-1] = modified_message
         return {"messages": messages}
 
     def remove_outer_code_blocks(self, text: str):
