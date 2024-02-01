@@ -32,13 +32,15 @@ Configure the service using the following environment variables:
 - `TEXT_GENERATION_MODEL`: Name of the model used for text generation (e.g., `gpt-4-1106-preview`).
 - `FUNCTION_CALLING_MODEL`: Model name for handling function calls (e.g., `gpt-3.5-turbo-0613`).
 - `SYSTEM_PROMPT`: System message or prompt URL to assist the model in generating content.
-- `USER_PROMPT`: Additional user-defined prompt for content generation.
+- `FUNCTION_CALLING_PROMPT`: Prompt for the function calling model.
+- `USER_PROMPT`: Additional user-defined prompt for guided output text generation.
+- `FUNCTION_CALLING_VALIDATION_SCHEMA`: Schema URL or json text for validating OpenAPI function calls (adds correction loop)
 - `BOT_NAME`: Bot name used in guiding the generation process.
 - `OPENAPI_SERVICE_SPEC`: URL or path to the OpenAPI service specification.
 - `OPENAPI_SERVICE_TOKEN`: Token for authenticating with the specified OpenAPI service.
 - `SERVICE_RESPONSE_SUBTREE`: Specific subtree to parse in the service response.
-- `OUTPUT_KEY`: Key identifier for the output generation process.
-- `OUTPUT_SCHEMA`: Schema URL or text defining the output format.
+- `OUTPUT_KEY`: Json key for the output of the text generation (if not the output is not a json) 
+- `OUTPUT_SCHEMA`: Schema URL or json text defining the output format.
 - `QUIET`: Set to `true` to disable output to standard output (STDOUT).
 
 ## Usage Example
