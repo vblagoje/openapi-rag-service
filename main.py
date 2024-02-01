@@ -485,33 +485,6 @@ class OpenAIJSONGenerator:
 
 
 @component
-class ChatMessageToJSONConverter:
-    """
-    Converts a list of ChatMessage instances to a list of JSON objects. This conversion
-    assumes that the 'content' field of each ChatMessage is a valid JSON string. Messages
-    that do not contain valid JSON are logged and skipped.
-    """
-
-    @component.output_types(output=List[Dict[str, Any]])
-    def run(self, messages: List[ChatMessage]) -> Dict[str, List[Dict[str, Any]]]:
-        """
-        Converts each ChatMessage in the provided list to a JSON object, if possible.
-
-        :param messages: A list of ChatMessage instances to be converted.
-        :return: A dictionary containing the list of successfully converted JSON objects under the key 'output'.
-        """
-        json_output = []
-        for message in messages:
-            try:
-                json_content = json.loads(message.content)
-                json_output.append(json_content)
-            except json.JSONDecodeError:
-                logging.error(f"Invalid JSON in message: {message.content}, skipping.")
-
-        return {"output": json_output}
-
-
-@component
 class FormattedOutputProcessor:
     """
     Processes and writes formatted output from JSON objects to specified output targets.
