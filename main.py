@@ -9,7 +9,7 @@ import re
 import sys
 import time
 from dataclasses import dataclass
-from typing import List, Dict, Any, Union, TextIO
+from typing import List, Dict, Any, Union, TextIO, Set
 from typing import Optional
 from urllib.parse import urlparse
 
@@ -18,12 +18,14 @@ from haystack import Pipeline
 from haystack import component
 from haystack.components.connectors import OpenAPIServiceConnector
 from haystack.components.converters import OpenAPIServiceToFunctions
+from haystack.components.fetchers import LinkContentFetcher
 from haystack.components.generators.chat import OpenAIChatGenerator
 from haystack.components.others import Multiplexer
 from haystack.components.routers import ConditionalRouter
 from haystack.dataclasses import ByteStream
 from haystack.dataclasses import ChatMessage
-from jinja2 import Template
+from jinja2 import Template, TemplateSyntaxError, meta
+from jinja2.nativetypes import NativeEnvironment
 from jsonschema.exceptions import ValidationError
 from jsonschema.validators import validate
 from openai import OpenAI
@@ -247,6 +249,152 @@ class FormattedOutputTarget:
                 raise
         else:
             return contextlib.nullcontext(self.destination)
+
+
+@component
+class OpenAPIServiceResponseTextGeneration:
+
+    def run(self, openapi_service_response: Dict[str, Any], system_prompt: str, user_prompt: Optional[str] = None):
+        service_response_message = ChatMessage.from_user(json.dumps(openapi_service_response))
+        sys_message = ChatMessage.from_system(system_prompt)
+        if user_prompt:
+            text_gen_prompt_messages = [sys_message] + [service_response_message] + [ChatMessage.from_user(user_prompt)]
+        else:
+            text_gen_prompt_messages = [system_message] + [service_response_message]
+
+        return {"text_gen_prompt_messages": text_gen_prompt_messages}
+
+
+class OutputAdaptationException(Exception):
+    """Exception raised when there is an error during output adaptation."""
+
+
+@component
+class ComponentOutputAdapter:
+    """
+    ComponentOutputAdapter in Haystack 2.x pipelines is designed to adapt the output of one component
+    to be compatible with the input of another component using Jinja2 template expressions.
+
+    The component configuration requires specifying the adaptation rules. Each rule comprises:
+    - 'input_template': A Jinja2 template string that defines how to adapt the input data.
+    - 'output_name': The name under which the adapted output value is published. This name is used to connect
+      the adapter to other components in the pipeline.
+
+    Example configuration:
+
+    ```python
+    adaptation_rules = [
+        {
+            "input_template": "{{ documents[0].content|json_loads }}",
+            "output_name": "json_object",
+            "output_type": Dict[str, Any],
+        },
+    ]
+    adapter = ComponentOutputAdapter(adaptation_rules)
+    ```
+
+    In the pipeline setup, the adapter is placed between components that require output adaptation.
+    """
+
+    predefined_filters = {
+        "json_loads": lambda s: json.loads(s) if isinstance(s, str) else json.loads(str(s)),
+        "json_dumps": lambda o: json.dumps(o),
+    }
+
+    def __init__(self, adaptation_rules: List[Dict], custom_filters: Optional[Dict[str, callable]] = None):
+        """
+        Initializes the ComponentOutputAdapter with a set of adaptation rules.
+
+        :param adaptation_rules: A list of adaptation rules, each comprising an input template and an output
+        (name and type).
+        """
+        self._validate_adaptation_rules(adaptation_rules)
+        self.adaptation_rules = adaptation_rules
+        self.custom_filters = {**(custom_filters or {}), **ComponentOutputAdapter.predefined_filters}
+
+        input_types: Set[str] = set()
+        output_types: Dict[str, str] = {}
+
+        # Create a Jinja native environment, we need it to:
+        # a) add custom filters to the environment for filter compilation stage
+        env = NativeEnvironment()
+        for name, filter_func in self.custom_filters.items():
+            env.filters[name] = filter_func
+
+        for rule in adaptation_rules:
+            # b) extract variables in the input_template
+            route_input_names = self._extract_variables(env, [rule["input_template"]])
+            input_types.update(route_input_names)
+
+            # extract outputs
+            output_types.update({rule["output_name"]: rule["output_type"]})
+        # the env is not needed, discarded automatically
+
+        component.set_input_types(self, **{var: Any for var in input_types})
+        component.set_output_types(self, **output_types)
+
+    def run(self, **kwargs):
+        """
+        Executes the output adaptation logic by applying the specified Jinja template expressions
+        to adapt the incoming data to a format suitable for downstream components.
+
+        :param kwargs: A dictionary containing the pipeline variables, which are inputs to the adaptation templates.
+
+        :return: A dictionary containing the adapted outputs, based on the adaptation rules.
+
+        :raises OutputAdaptationException: If there's an error during the adaptation process.
+        """
+        env = NativeEnvironment()
+        for name, filter_func in self.custom_filters.items():
+            env.filters[name] = filter_func
+        adapted_outputs = {}
+
+        for rule in self.adaptation_rules:
+            try:
+                template = env.from_string(rule["input_template"])
+                adapted_output = template.render(**kwargs)
+                adapted_outputs[rule["output_name"]] = adapted_output
+            except Exception as e:
+                raise OutputAdaptationException(f"Error adapting output for rule '{rule}': {e}") from e
+
+        return adapted_outputs
+
+    def _validate_adaptation_rules(self, adaptation_rules: List[Dict]):
+        """
+        Validates the set of adaptation rules provided during initialization.
+
+        :param adaptation_rules: The adaptation rules to validate.
+        :type adaptation_rules: Dict
+        """
+        env = NativeEnvironment()
+        for rule in adaptation_rules:
+            try:
+                keys = set(rule.keys())
+                mandatory_fields = {"input_template", "output_name", "output_type"}
+                has_all_mandatory_fields = mandatory_fields.issubset(keys)
+                if not has_all_mandatory_fields:
+                    raise ValueError(
+                        f"Adaptation rule must contain 'input_template', 'output_name' and 'output_type' fields: {rule}"
+                    )
+                env.parse(rule["input_template"])  # Validate template syntax
+            except TemplateSyntaxError as e:
+                raise ValueError(f"Invalid Jinja template in adaptation rule '{rule}': {e}")
+
+    def _extract_variables(self, env: NativeEnvironment, templates: List[str]) -> Set[str]:
+        """
+        Extracts all variables from a list of Jinja template strings.
+
+        :param env: A Jinja environment.
+        :type env: Environment
+        :param templates: A list of Jinja template strings.
+        :type templates: List[str]
+        :return: A set of variable names.
+        """
+        variables = set()
+        for template in templates:
+            ast = env.parse(template)
+            variables.update(meta.find_undeclared_variables(ast))
+        return variables
 
 
 @component
@@ -571,9 +719,7 @@ class FormattedOutputProcessor:
 if __name__ == "__main__":
     # make sure we have the required environment variables and have content for the required files
     get_env_var_or_default(env_var_name="OPENAI_API_KEY", required=True)
-    open_api_spec = fetch_content_from(
-        [get_env_var_or_default(env_var_name="OPENAPI_SERVICE_SPEC", required=True)], required=True
-    )
+    open_api_spec = [get_env_var_or_default(env_var_name="OPENAPI_SERVICE_SPEC", required=True)]
     system_prompt_text = fetch_content_from(
         [get_env_var_or_default(env_var_name="SYSTEM_PROMPT", required=True)], required=True
     )
@@ -605,26 +751,58 @@ if __name__ == "__main__":
         print("Exiting, user prompt contains the word 'skip'.")
         sys.exit(0)
 
-    spec_to_functions = OpenAPIServiceToFunctions()
-    openai_functions_definition_docs = spec_to_functions.run(
-        sources=[ByteStream.from_string(text=open_api_spec)], system_messages=["TODO-REMOVE-ME"]
-    )
-    openai_functions_definition: ChatMessage = openai_functions_definition_docs["documents"][0]
-    openai_functions_definition: str = json.loads(openai_functions_definition.content)
+    a_1 = [
+        {
+            "input_template": "{{ documents[0].content|json_loads }}",
+            "output_name": "function_definition",
+            "output_type": Dict[str, Any],
+        }
+    ]
 
-    open_api_service_spec_as_json = json.loads(open_api_spec)
-    # Setup service authorization token, title is required field in OpenAPI spec
-    service_title = open_api_service_spec_as_json["info"]["title"]
-    if has_authentication_method(open_api_service_spec_as_json):
-        if not service_token:
-            raise ValueError(
-                f"Service {service_title} requires authorization token. "
-                f"Please set OPENAPI_SERVICE_TOKEN environment variable."
-            )
-        else:
-            service_auth = {service_title: service_token}
-    else:
-        service_auth = None
+    a_2 = [
+        {
+            "input_template": """
+            {              
+              "tools": [{"type": "function", "function": {{ openai_functions_definition | tojson }} }],
+              "tool_choice": {"type": "function", "function": {"name": "{{ openai_functions_definition.name }}"}}              
+            }
+            """,
+            "output_name": "formatted_generation_kwargs",
+            "output_type": str,
+        }
+    ]
+
+    a_3 = [
+        {
+            "input_template": "{{ formatted_generation_kwargs|json_loads }}",
+            "output_name": "generation_kwargs",
+            "output_type": Dict[str, Any],
+        }
+    ]
+
+    a_4 = [
+        {
+            "input_template": "{{ streams[0]|json_loads }}",
+            "output_name": "service_openapi_spec",
+            "output_type": Dict[str, Any],
+        }
+    ]
+
+    a_5 = [
+        {
+            "input_template": "{{ service_response[0].content|json_loads }}",
+            "output_name": "service_response_as_json",
+            "output_type": Dict[str, Any],
+        }
+    ]
+
+    a_6 = [
+        {
+            "input_template": "{{ service_response_as_json[subtree] if subtree is not none else service_response_as_json }}",
+            "output_name": "final_service_response_as_json",
+            "output_type": Dict[str, Any],
+        }
+    ]
 
     routes = [
         {
@@ -642,13 +820,34 @@ if __name__ == "__main__":
     ]
     fc_error_handling = ConditionalRouter(routes)
     invoke_service_pipe = Pipeline()
+    invoke_service_pipe.add_component("fetcher", LinkContentFetcher())
+    invoke_service_pipe.add_component("mx_fetcher", Multiplexer(List[ByteStream]))
+    invoke_service_pipe.add_component("spec_to_functions", OpenAPIServiceToFunctions())
+    invoke_service_pipe.add_component("adapter_1", ComponentOutputAdapter(a_1))
+    invoke_service_pipe.add_component("adapter_2", ComponentOutputAdapter(a_2))
+    invoke_service_pipe.add_component("adapter_3", ComponentOutputAdapter(a_3))
+    invoke_service_pipe.add_component("adapter_4", ComponentOutputAdapter(a_4))
+
     invoke_service_pipe.add_component("mx_function_llm", Multiplexer(List[ChatMessage]))
     invoke_service_pipe.add_component("mx_openapi_container", Multiplexer(List[ChatMessage]))
     invoke_service_pipe.add_component("function_llm", OpenAIChatGenerator(model=function_calling_model_name))
     invoke_service_pipe.add_component("router", fc_error_handling)
     invoke_service_pipe.add_component("schema_validator", SchemaValidator())
-    invoke_service_pipe.add_component("openapi_container", OpenAPIServiceConnector(service_auth))
+    invoke_service_pipe.add_component("openapi_container", OpenAPIServiceConnector())
+    invoke_service_pipe.add_component("adapter_5", ComponentOutputAdapter(a_5))
+    invoke_service_pipe.add_component("adapter_6", ComponentOutputAdapter(a_6))
+
+    invoke_service_pipe.connect("fetcher", "mx_fetcher")
+    invoke_service_pipe.connect("mx_fetcher", "spec_to_functions.sources")
+    invoke_service_pipe.connect("mx_fetcher", "adapter_4")
     invoke_service_pipe.connect("mx_function_llm", "function_llm.messages")
+    invoke_service_pipe.connect("spec_to_functions", "adapter_1")
+    invoke_service_pipe.connect("adapter_1", "adapter_2")
+    invoke_service_pipe.connect("adapter_2", "adapter_3")
+    invoke_service_pipe.connect("adapter_3", "function_llm.generation_kwargs")
+    invoke_service_pipe.connect("adapter_4", "openapi_container.service_openapi_spec")
+    invoke_service_pipe.connect("openapi_container.service_response", "adapter_5")
+    invoke_service_pipe.connect("adapter_5", "adapter_6")
     invoke_service_pipe.connect("function_llm.replies", "router.messages")
     invoke_service_pipe.connect("router.with_error_correction", "schema_validator.messages")
     invoke_service_pipe.connect("router.no_error_correction", "mx_openapi_container")
@@ -656,30 +855,22 @@ if __name__ == "__main__":
     invoke_service_pipe.connect("schema_validator.validated", "mx_openapi_container")
     invoke_service_pipe.connect("schema_validator.validation_error", "mx_function_llm")
 
-    resolve_service_params_messages = [
-        ChatMessage.from_system("You are a helpful assistant capable of function calling."),
-        ChatMessage.from_user(function_calling_prompt),
-    ]
-
-    tools_param = [{"type": "function", "function": openai_functions_definition}]
-    tool_choice = {"type": "function", "function": {"name": openai_functions_definition["name"]}}
+    resolve_service_params_messages = [ChatMessage.from_user(function_calling_prompt)]
 
     service_response = invoke_service_pipe.run(
         data={
+            "fetcher": {"urls": open_api_spec},
+            "spec_to_functions": {"system_messages": ["TODO-REMOVE-ME"]},
             "mx_function_llm": {"value": resolve_service_params_messages},
-            "function_llm": {"generation_kwargs": {"tools": tools_param, "tool_choice": tool_choice}},
             "router": {"fc_json_schema": bool(fc_json_schema)},
-            "openapi_container": {"service_openapi_spec": open_api_service_spec_as_json},
+            "openapi_container": {"service_credentials": service_token},
             "schema_validator": {"previous_messages": resolve_service_params_messages, "json_schema": fc_json_schema},
+            "adapter_6": {"subtree": service_response_subtree},
         }
     )
-    service_response_msgs: List[ChatMessage] = service_response["openapi_container"]["service_response"]
-    service_response_json = json.loads(service_response_msgs[0].content)
-    service_response_json = (
-        service_response_json[service_response_subtree] if service_response_subtree else service_response_json
-    )
-    diff_message = ChatMessage.from_user(json.dumps(service_response_json))
+    service_response_payload = service_response["adapter_6"]["final_service_response_as_json"]
 
+    diff_message = ChatMessage.from_user(json.dumps(service_response_payload))
     system_message = ChatMessage.from_system(system_prompt_text)
     if user_instruction:
         text_gen_prompt_messages = [system_message] + [diff_message] + [ChatMessage.from_user(user_instruction)]
