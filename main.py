@@ -275,17 +275,17 @@ class ComponentOutputAdapter:
     to be compatible with the input of another component using Jinja2 template expressions.
 
     The component configuration requires specifying the adaptation rules. Each rule comprises:
-    - 'input_template': A Jinja2 template string that defines how to adapt the input data.
-    - 'output_name': The name under which the adapted output value is published. This name is used to connect
-      the adapter to other components in the pipeline.
+    - 'template': A Jinja2 template string that defines how to adapt the input data.
+    - 'output_name': The optional name under which the adapted output value is published. This name is used to connect
+      the adapter to other components in the pipeline. If not provided, the default name 'output' is used.
+    - 'output_type': The type of the output data (e.g., str, List[int]).
 
     Example configuration:
 
     ```python
     adaptation_rules = [
         {
-            "input_template": "{{ documents[0].content|json_loads }}",
-            "output_name": "json_object",
+            "template": "{{ documents[0].content|json_loads }}",
             "output_type": Dict[str, Any],
         },
     ]
@@ -321,11 +321,14 @@ class ComponentOutputAdapter:
             env.filters[name] = filter_func
 
         for rule in adaptation_rules:
-            # b) extract variables in the input_template
-            route_input_names = self._extract_variables(env, [rule["input_template"]])
+            # b) extract variables in the template
+            route_input_names = self._extract_variables(env, [rule["template"]])
             input_types.update(route_input_names)
 
             # extract outputs
+            if "output_name" not in rule:
+                rule["output_name"] = "output"
+
             output_types.update({rule["output_name"]: rule["output_type"]})
         # the env is not needed, discarded automatically
 
@@ -350,7 +353,7 @@ class ComponentOutputAdapter:
 
         for rule in self.adaptation_rules:
             try:
-                template = env.from_string(rule["input_template"])
+                template = env.from_string(rule["template"])
                 adapted_output = template.render(**kwargs)
                 adapted_outputs[rule["output_name"]] = adapted_output
             except Exception as e:
@@ -369,13 +372,11 @@ class ComponentOutputAdapter:
         for rule in adaptation_rules:
             try:
                 keys = set(rule.keys())
-                mandatory_fields = {"input_template", "output_name", "output_type"}
+                mandatory_fields = {"template", "output_type"}
                 has_all_mandatory_fields = mandatory_fields.issubset(keys)
                 if not has_all_mandatory_fields:
-                    raise ValueError(
-                        f"Adaptation rule must contain 'input_template', 'output_name' and 'output_type' fields: {rule}"
-                    )
-                env.parse(rule["input_template"])  # Validate template syntax
+                    raise ValueError(f"Adaptation rule must contain 'template' and 'output_type' fields: {rule}")
+                env.parse(rule["template"])  # Validate template syntax
             except TemplateSyntaxError as e:
                 raise ValueError(f"Invalid Jinja template in adaptation rule '{rule}': {e}")
 
@@ -755,58 +756,28 @@ if __name__ == "__main__":
         sys.exit(0)
 
     # adapters for invoke_service_pipe pipeline
-    a_1 = [
-        {
-            "input_template": "{{ documents[0].content|json_loads }}",
-            "output_name": "function_definition",
-            "output_type": Dict[str, Any],
-        }
-    ]
+    a1 = ComponentOutputAdapter([{"template": "{{ documents[0].content|json_loads }}", "output_type": Dict[str, Any]}])
 
     a_2 = [
         {
-            "input_template": """
+            "template": """
             {              
               "tools": [{"type": "function", "function": {{ openai_functions_definition | tojson }} }],
               "tool_choice": {"type": "function", "function": {"name": "{{ openai_functions_definition.name }}"}}              
             }
             """,
-            "output_name": "formatted_generation_kwargs",
             "output_type": str,
         }
     ]
-
-    a_3 = [
-        {
-            "input_template": "{{ formatted_generation_kwargs|json_loads }}",
-            "output_name": "generation_kwargs",
-            "output_type": Dict[str, Any],
-        }
-    ]
-
-    a_4 = [
-        {
-            "input_template": "{{ streams[0]|json_loads }}",
-            "output_name": "service_openapi_spec",
-            "output_type": Dict[str, Any],
-        }
-    ]
-
-    a_5 = [
-        {
-            "input_template": "{{ service_response[0].content|json_loads }}",
-            "output_name": "service_response_as_json",
-            "output_type": Dict[str, Any],
-        }
-    ]
+    a2 = ComponentOutputAdapter(a_2)
+    a3 = ComponentOutputAdapter([{"template": "{{ generation_kwargs|json_loads }}", "output_type": Dict[str, Any]}])
+    a4 = ComponentOutputAdapter([{"template": "{{ streams[0]|json_loads }}", "output_type": Dict[str, Any]}])
+    a5 = ComponentOutputAdapter([{"template": "{{ resp[0].content|json_loads }}", "output_type": Dict[str, Any]}])
 
     a_6 = [
-        {
-            "input_template": "{{ service_response_as_json[subtree] if subtree is not none else service_response_as_json }}",
-            "output_name": "final_service_response_as_json",
-            "output_type": Dict[str, Any],
-        }
+        {"template": "{{ json_resp[subtree] if subtree is not none else json_resp }}", "output_type": Dict[str, Any]}
     ]
+    a6 = ComponentOutputAdapter(a_6)
 
     routes = [
         {
@@ -827,10 +798,10 @@ if __name__ == "__main__":
     invoke_service_pipe.add_component("fetcher", LinkContentFetcher())
     invoke_service_pipe.add_component("mx_fetcher", Multiplexer(List[ByteStream]))
     invoke_service_pipe.add_component("spec_to_functions", OpenAPIServiceToFunctions())
-    invoke_service_pipe.add_component("adapter_1", ComponentOutputAdapter(a_1))
-    invoke_service_pipe.add_component("adapter_2", ComponentOutputAdapter(a_2))
-    invoke_service_pipe.add_component("adapter_3", ComponentOutputAdapter(a_3))
-    invoke_service_pipe.add_component("adapter_4", ComponentOutputAdapter(a_4))
+    invoke_service_pipe.add_component("adapter_1", a1)
+    invoke_service_pipe.add_component("adapter_2", a2)
+    invoke_service_pipe.add_component("adapter_3", a3)
+    invoke_service_pipe.add_component("adapter_4", a4)
 
     invoke_service_pipe.add_component("mx_function_llm", Multiplexer(List[ChatMessage]))
     invoke_service_pipe.add_component("mx_openapi_container", Multiplexer(List[ChatMessage]))
@@ -838,8 +809,8 @@ if __name__ == "__main__":
     invoke_service_pipe.add_component("router", fc_error_handling)
     invoke_service_pipe.add_component("schema_validator", SchemaValidator())
     invoke_service_pipe.add_component("openapi_container", OpenAPIServiceConnector())
-    invoke_service_pipe.add_component("adapter_5", ComponentOutputAdapter(a_5))
-    invoke_service_pipe.add_component("adapter_6", ComponentOutputAdapter(a_6))
+    invoke_service_pipe.add_component("adapter_5", a5)
+    invoke_service_pipe.add_component("adapter_6", a6)
     invoke_service_pipe.add_component("final_prompt_start", OpenAPIServiceResponseTextGeneration())
 
     invoke_service_pipe.connect("fetcher", "mx_fetcher")
@@ -852,7 +823,7 @@ if __name__ == "__main__":
     invoke_service_pipe.connect("adapter_3", "function_llm.generation_kwargs")
     invoke_service_pipe.connect("adapter_4", "openapi_container.service_openapi_spec")
     invoke_service_pipe.connect("openapi_container.service_response", "adapter_5")
-    invoke_service_pipe.connect("adapter_5", "adapter_6")
+    invoke_service_pipe.connect("adapter_5", "adapter_6.json_resp")
     invoke_service_pipe.connect("adapter_6", "final_prompt_start.openapi_service_response")
     invoke_service_pipe.connect("function_llm.replies", "router.messages")
     invoke_service_pipe.connect("router.with_error_correction", "schema_validator.messages")
