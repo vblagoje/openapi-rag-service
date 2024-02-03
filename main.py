@@ -269,9 +269,9 @@ class OutputAdaptationException(Exception):
 
 
 @component
-class ComponentOutputAdapter:
+class OutputAdapter:
     """
-    ComponentOutputAdapter in Haystack 2.x pipelines is designed to adapt the output of one component
+    OutputAdapter in Haystack 2.x pipelines is designed to adapt the output of one component
     to be compatible with the input of another component using Jinja2 template expressions.
 
     The component configuration requires specifying the adaptation rules. Each rule comprises:
@@ -283,13 +283,8 @@ class ComponentOutputAdapter:
     Example configuration:
 
     ```python
-    adaptation_rules = [
-        {
-            "template": "{{ documents[0].content|json_loads }}",
-            "output_type": Dict[str, Any],
-        },
-    ]
-    adapter = ComponentOutputAdapter(adaptation_rules)
+
+    adapter = OutputAdapter("{{ documents[0].content|json_loads }}",  Dict[str, Any])
     ```
 
     In the pipeline setup, the adapter is placed between components that require output adaptation.
@@ -300,40 +295,35 @@ class ComponentOutputAdapter:
         "json_dumps": lambda o: json.dumps(o),
     }
 
-    def __init__(self, adaptation_rules: List[Dict], custom_filters: Optional[Dict[str, callable]] = None):
+    def __init__(self, template: str, output_type: Any, custom_filters: Optional[Dict[str, callable]] = None):
         """
-        Initializes the ComponentOutputAdapter with a set of adaptation rules.
-
-        :param adaptation_rules: A list of adaptation rules, each comprising an input template and an output
-        (name and type).
+        Initializes the OutputAdapter with a set of adaptation rules.
+        :param template: A Jinja2 template string that defines how to adapt the input data.
+        :param output_type: The type of the output data (e.g., str, List[int]).
+        :param custom_filters: A dictionary of custom Jinja2 filters to be used in the template.
         """
-        self._validate_adaptation_rules(adaptation_rules)
-        self.adaptation_rules = adaptation_rules
-        self.custom_filters = {**(custom_filters or {}), **ComponentOutputAdapter.predefined_filters}
-
+        self.custom_filters = {**(custom_filters or {}), **OutputAdapter.predefined_filters}
         input_types: Set[str] = set()
-        output_types: Dict[str, str] = {}
 
         # Create a Jinja native environment, we need it to:
         # a) add custom filters to the environment for filter compilation stage
         env = NativeEnvironment()
+        try:
+            env.parse(template)  # Validate template syntax
+            self.template = template
+        except TemplateSyntaxError as e:
+            raise ValueError(f"Invalid Jinja template '{template}': {e}")
+
         for name, filter_func in self.custom_filters.items():
             env.filters[name] = filter_func
 
-        for rule in adaptation_rules:
-            # b) extract variables in the template
-            route_input_names = self._extract_variables(env, [rule["template"]])
-            input_types.update(route_input_names)
+        # b) extract variables in the template
+        route_input_names = self._extract_variables(env)
+        input_types.update(route_input_names)
 
-            # extract outputs
-            if "output_name" not in rule:
-                rule["output_name"] = "output"
-
-            output_types.update({rule["output_name"]: rule["output_type"]})
         # the env is not needed, discarded automatically
-
         component.set_input_types(self, **{var: Any for var in input_types})
-        component.set_output_types(self, **output_types)
+        component.set_output_types(self, **{"output": output_type})
 
     def run(self, **kwargs):
         """
@@ -351,49 +341,24 @@ class ComponentOutputAdapter:
             env.filters[name] = filter_func
         adapted_outputs = {}
 
-        for rule in self.adaptation_rules:
-            try:
-                template = env.from_string(rule["template"])
-                adapted_output = template.render(**kwargs)
-                adapted_outputs[rule["output_name"]] = adapted_output
-            except Exception as e:
-                raise OutputAdaptationException(f"Error adapting output for rule '{rule}': {e}") from e
+        try:
+            adapted_output = env.from_string(self.template).render(**kwargs)
+            adapted_outputs["output"] = adapted_output
+        except Exception as e:
+            raise OutputAdaptationException(f"Error adapting output for '{self.template}': {e}") from e
 
         return adapted_outputs
 
-    def _validate_adaptation_rules(self, adaptation_rules: List[Dict]):
-        """
-        Validates the set of adaptation rules provided during initialization.
-
-        :param adaptation_rules: The adaptation rules to validate.
-        :type adaptation_rules: Dict
-        """
-        env = NativeEnvironment()
-        for rule in adaptation_rules:
-            try:
-                keys = set(rule.keys())
-                mandatory_fields = {"template", "output_type"}
-                has_all_mandatory_fields = mandatory_fields.issubset(keys)
-                if not has_all_mandatory_fields:
-                    raise ValueError(f"Adaptation rule must contain 'template' and 'output_type' fields: {rule}")
-                env.parse(rule["template"])  # Validate template syntax
-            except TemplateSyntaxError as e:
-                raise ValueError(f"Invalid Jinja template in adaptation rule '{rule}': {e}")
-
-    def _extract_variables(self, env: NativeEnvironment, templates: List[str]) -> Set[str]:
+    def _extract_variables(self, env: NativeEnvironment) -> Set[str]:
         """
         Extracts all variables from a list of Jinja template strings.
 
-        :param env: A Jinja environment.
-        :type env: Environment
-        :param templates: A list of Jinja template strings.
-        :type templates: List[str]
-        :return: A set of variable names.
+        :param env: A Jinja native environment.
+        :return: A set of variable names extracted from the template strings.
         """
         variables = set()
-        for template in templates:
-            ast = env.parse(template)
-            variables.update(meta.find_undeclared_variables(ast))
+        ast = env.parse(self.template)
+        variables.update(meta.find_undeclared_variables(ast))
         return variables
 
 
@@ -755,39 +720,21 @@ if __name__ == "__main__":
         print("Exiting, user prompt contains the word 'skip'.")
         sys.exit(0)
 
-    # adapters for invoke_service_pipe pipeline
-    a1 = ComponentOutputAdapter([{"template": "{{ documents[0].content|json_loads }}", "output_type": Dict[str, Any]}])
-
-    a_2 = [
-        {
-            "template": """
-            {              
-              "tools": [{"type": "function", "function": {{ openai_functions_definition | tojson }} }],
-              "tool_choice": {"type": "function", "function": {"name": "{{ openai_functions_definition.name }}"}}              
-            }
-            """,
-            "output_type": str,
-        }
-    ]
-    a2 = ComponentOutputAdapter(a_2)
-    a3 = ComponentOutputAdapter([{"template": "{{ generation_kwargs|json_loads }}", "output_type": Dict[str, Any]}])
-    a4 = ComponentOutputAdapter([{"template": "{{ streams[0]|json_loads }}", "output_type": Dict[str, Any]}])
-    a5 = ComponentOutputAdapter([{"template": "{{ resp[0].content|json_loads }}", "output_type": Dict[str, Any]}])
-
-    a_6 = [
-        {"template": "{{ json_resp[subtree] if subtree is not none else json_resp }}", "output_type": Dict[str, Any]}
-    ]
-    a6 = ComponentOutputAdapter(a_6)
-
+    gen_kwargs_template = """
+    {
+      "tools": [{"type": "function", "function": {{ openai_functions_definition | tojson }} }],
+      "tool_choice": {"type": "function", "function": {"name": "{{ openai_functions_definition.name }}"}} 
+    }
+    """
     routes = [
         {
-            "condition": "{{fc_json_schema}}",
+            "condition": "{{has_json_schema}}",
             "output": "{{messages}}",
             "output_name": "with_error_correction",
             "output_type": List[ChatMessage],
         },
         {
-            "condition": "{{not fc_json_schema}}",
+            "condition": "{{not has_json_schema}}",
             "output": "{{messages}}",
             "output_name": "no_error_correction",
             "output_type": List[ChatMessage],
@@ -798,10 +745,10 @@ if __name__ == "__main__":
     invoke_service_pipe.add_component("fetcher", LinkContentFetcher())
     invoke_service_pipe.add_component("mx_fetcher", Multiplexer(List[ByteStream]))
     invoke_service_pipe.add_component("spec_to_functions", OpenAPIServiceToFunctions())
-    invoke_service_pipe.add_component("adapter_1", a1)
-    invoke_service_pipe.add_component("adapter_2", a2)
-    invoke_service_pipe.add_component("adapter_3", a3)
-    invoke_service_pipe.add_component("adapter_4", a4)
+    invoke_service_pipe.add_component("a1", OutputAdapter("{{ documents[0].content|json_loads }}", Dict[str, Any]))
+    invoke_service_pipe.add_component("a2", OutputAdapter(gen_kwargs_template, str))
+    invoke_service_pipe.add_component("a3", OutputAdapter("{{ generation_kwargs|json_loads }}", Dict[str, Any]))
+    invoke_service_pipe.add_component("a4", OutputAdapter("{{ streams[0]|json_loads }}", Dict[str, Any]))
 
     invoke_service_pipe.add_component("mx_function_llm", Multiplexer(List[ChatMessage]))
     invoke_service_pipe.add_component("mx_openapi_container", Multiplexer(List[ChatMessage]))
@@ -809,22 +756,24 @@ if __name__ == "__main__":
     invoke_service_pipe.add_component("router", fc_error_handling)
     invoke_service_pipe.add_component("schema_validator", SchemaValidator())
     invoke_service_pipe.add_component("openapi_container", OpenAPIServiceConnector())
-    invoke_service_pipe.add_component("adapter_5", a5)
-    invoke_service_pipe.add_component("adapter_6", a6)
+    invoke_service_pipe.add_component("a5", OutputAdapter("{{ resp[0].content|json_loads }}", Dict[str, Any]))
+    invoke_service_pipe.add_component(
+        "a6", OutputAdapter("{{ json_resp[subtree] if subtree is not none else json_resp }}", Dict[str, Any])
+    )
     invoke_service_pipe.add_component("final_prompt_start", OpenAPIServiceResponseTextGeneration())
 
     invoke_service_pipe.connect("fetcher", "mx_fetcher")
     invoke_service_pipe.connect("mx_fetcher", "spec_to_functions.sources")
-    invoke_service_pipe.connect("mx_fetcher", "adapter_4")
+    invoke_service_pipe.connect("mx_fetcher", "a4")
     invoke_service_pipe.connect("mx_function_llm", "function_llm.messages")
-    invoke_service_pipe.connect("spec_to_functions", "adapter_1")
-    invoke_service_pipe.connect("adapter_1", "adapter_2")
-    invoke_service_pipe.connect("adapter_2", "adapter_3")
-    invoke_service_pipe.connect("adapter_3", "function_llm.generation_kwargs")
-    invoke_service_pipe.connect("adapter_4", "openapi_container.service_openapi_spec")
-    invoke_service_pipe.connect("openapi_container.service_response", "adapter_5")
-    invoke_service_pipe.connect("adapter_5", "adapter_6.json_resp")
-    invoke_service_pipe.connect("adapter_6", "final_prompt_start.openapi_service_response")
+    invoke_service_pipe.connect("spec_to_functions", "a1")
+    invoke_service_pipe.connect("a1", "a2")
+    invoke_service_pipe.connect("a2", "a3")
+    invoke_service_pipe.connect("a3", "function_llm.generation_kwargs")
+    invoke_service_pipe.connect("a4", "openapi_container.service_openapi_spec")
+    invoke_service_pipe.connect("openapi_container.service_response", "a5")
+    invoke_service_pipe.connect("a5", "a6.json_resp")
+    invoke_service_pipe.connect("a6", "final_prompt_start.openapi_service_response")
     invoke_service_pipe.connect("function_llm.replies", "router.messages")
     invoke_service_pipe.connect("router.with_error_correction", "schema_validator.messages")
     invoke_service_pipe.connect("router.no_error_correction", "mx_openapi_container")
@@ -838,13 +787,13 @@ if __name__ == "__main__":
             "fetcher": {"urls": open_api_spec},
             "spec_to_functions": {"system_messages": ["TODO-REMOVE-ME"]},
             "mx_function_llm": {"value": [ChatMessage.from_user(function_calling_prompt)]},
-            "router": {"fc_json_schema": bool(fc_json_schema)},
+            "router": {"has_json_schema": bool(fc_json_schema)},
             "openapi_container": {"service_credentials": service_token},
             "schema_validator": {
                 "previous_messages": [ChatMessage.from_user(function_calling_prompt)],
                 "json_schema": fc_json_schema,
             },
-            "adapter_6": {"subtree": service_response_subtree},
+            "a6": {"subtree": service_response_subtree},
             "final_prompt_start": {"system_prompt": system_prompt_text, "user_prompt": user_instruction},
         }
     )
