@@ -22,7 +22,7 @@ from haystack.components.fetchers import LinkContentFetcher
 from haystack.components.generators.chat import OpenAIChatGenerator
 from haystack.components.others import Multiplexer
 from haystack.components.routers import ConditionalRouter
-from haystack.dataclasses import ByteStream
+from haystack.dataclasses import ByteStream, ChatRole
 from haystack.dataclasses import ChatMessage
 from jinja2 import Template, TemplateSyntaxError, meta
 from jinja2.nativetypes import NativeEnvironment
@@ -253,16 +253,15 @@ class FormattedOutputTarget:
 
 @component
 class OpenAPIServiceResponseTextGeneration:
-
     def run(self, openapi_service_response: Dict[str, Any], system_prompt: str, user_prompt: Optional[str] = None):
         service_response_message = ChatMessage.from_user(json.dumps(openapi_service_response))
         sys_message = ChatMessage.from_system(system_prompt)
         if user_prompt:
-            text_gen_prompt_messages = [sys_message] + [service_response_message] + [ChatMessage.from_user(user_prompt)]
+            text_gen_prompt = [sys_message] + [service_response_message] + [ChatMessage.from_user(user_prompt)]
         else:
-            text_gen_prompt_messages = [system_message] + [service_response_message]
+            text_gen_prompt = [sys_message] + [service_response_message]
 
-        return {"text_gen_prompt_messages": text_gen_prompt_messages}
+        return {"prompt_messages": text_gen_prompt}
 
 
 class OutputAdaptationException(Exception):
@@ -435,7 +434,7 @@ class SchemaValidator:
             error_schema_path = " -> ".join(map(str, e.absolute_schema_path)) if e.absolute_schema_path else "N/A"
 
             recovery_prompt = self.construct_error_recovery_message(
-                e.message, error_path, error_schema_path, validation_schema
+                str(e), error_path, error_schema_path, validation_schema
             )
             previous_messages = previous_messages or []
             complete_message_list = previous_messages + messages + [ChatMessage.from_user(recovery_prompt)]
@@ -572,14 +571,18 @@ class OpenAIJSONGenerator:
         :param output_schema_json: JSON defining the schema for the output.
         :return: A dictionary containing the processed responses under the key 'output'.
         """
-        format_to_json_message = [messages[-1]]
+        format_to_json_message: ChatMessage = messages[-1]
+
+        # some LLM providers are strict about message order
+        if format_to_json_message.is_from(ChatRole.ASSISTANT):
+            format_to_json_message = ChatMessage.from_user(format_to_json_message.content)
 
         tools_param = [{"type": "function", "function": output_schema_json}]
         tool_choice = {"type": "function", "function": {"name": output_schema_json["name"]}}
         generation_kwargs = {"tools": tools_param, "tool_choice": tool_choice}
 
         # adapt ChatMessage(s) to the format expected by the OpenAI API
-        openai_formatted_messages = self._convert_to_openai_format(format_to_json_message)
+        openai_formatted_messages = self._convert_to_openai_format([format_to_json_message])
         chat_completion: ChatCompletion = self.client.chat.completions.create(
             model=self.model,
             messages=openai_formatted_messages,  # type: ignore # openai expects list of specific message types
@@ -751,6 +754,7 @@ if __name__ == "__main__":
         print("Exiting, user prompt contains the word 'skip'.")
         sys.exit(0)
 
+    # adapters for invoke_service_pipe pipeline
     a_1 = [
         {
             "input_template": "{{ documents[0].content|json_loads }}",
@@ -836,6 +840,7 @@ if __name__ == "__main__":
     invoke_service_pipe.add_component("openapi_container", OpenAPIServiceConnector())
     invoke_service_pipe.add_component("adapter_5", ComponentOutputAdapter(a_5))
     invoke_service_pipe.add_component("adapter_6", ComponentOutputAdapter(a_6))
+    invoke_service_pipe.add_component("final_prompt_start", OpenAPIServiceResponseTextGeneration())
 
     invoke_service_pipe.connect("fetcher", "mx_fetcher")
     invoke_service_pipe.connect("mx_fetcher", "spec_to_functions.sources")
@@ -848,6 +853,7 @@ if __name__ == "__main__":
     invoke_service_pipe.connect("adapter_4", "openapi_container.service_openapi_spec")
     invoke_service_pipe.connect("openapi_container.service_response", "adapter_5")
     invoke_service_pipe.connect("adapter_5", "adapter_6")
+    invoke_service_pipe.connect("adapter_6", "final_prompt_start.openapi_service_response")
     invoke_service_pipe.connect("function_llm.replies", "router.messages")
     invoke_service_pipe.connect("router.with_error_correction", "schema_validator.messages")
     invoke_service_pipe.connect("router.no_error_correction", "mx_openapi_container")
@@ -855,27 +861,25 @@ if __name__ == "__main__":
     invoke_service_pipe.connect("schema_validator.validated", "mx_openapi_container")
     invoke_service_pipe.connect("schema_validator.validation_error", "mx_function_llm")
 
-    resolve_service_params_messages = [ChatMessage.from_user(function_calling_prompt)]
-
+    print("Running invoke_service_pipe pipeline...")
     service_response = invoke_service_pipe.run(
         data={
             "fetcher": {"urls": open_api_spec},
             "spec_to_functions": {"system_messages": ["TODO-REMOVE-ME"]},
-            "mx_function_llm": {"value": resolve_service_params_messages},
+            "mx_function_llm": {"value": [ChatMessage.from_user(function_calling_prompt)]},
             "router": {"fc_json_schema": bool(fc_json_schema)},
             "openapi_container": {"service_credentials": service_token},
-            "schema_validator": {"previous_messages": resolve_service_params_messages, "json_schema": fc_json_schema},
+            "schema_validator": {
+                "previous_messages": [ChatMessage.from_user(function_calling_prompt)],
+                "json_schema": fc_json_schema,
+            },
             "adapter_6": {"subtree": service_response_subtree},
+            "final_prompt_start": {"system_prompt": system_prompt_text, "user_prompt": user_instruction},
         }
     )
-    service_response_payload = service_response["adapter_6"]["final_service_response_as_json"]
 
-    diff_message = ChatMessage.from_user(json.dumps(service_response_payload))
-    system_message = ChatMessage.from_system(system_prompt_text)
-    if user_instruction:
-        text_gen_prompt_messages = [system_message] + [diff_message] + [ChatMessage.from_user(user_instruction)]
-    else:
-        text_gen_prompt_messages = [system_message] + [diff_message]
+    text_gen_messages = service_response["final_prompt_start"]["prompt_messages"]
+    # we are now ready to generate the final text
 
     gen_text_pipeline = Pipeline()
     routes = [
@@ -918,14 +922,15 @@ if __name__ == "__main__":
     if not get_env_var_or_default(env_var_name="QUIET", default_value=False):
         output_sinks.append(FormattedOutputTarget(sys.stdout, STDOUT_OUTPUT_TEMPLATE))
 
+    print("Running gen_text_pipeline pipeline...")
     gen_text_pipeline.run(
         data={
-            "messages": text_gen_prompt_messages,
+            "messages": text_gen_messages,
             "has_output_schema": bool(output_schema),
             "output_key": output_key,
             "output_schema_json": output_schema,
             "output_targets": output_sinks,
-            "previous_messages": text_gen_prompt_messages,
+            "previous_messages": text_gen_messages,
             "json_schema": output_schema,
         }
     )
