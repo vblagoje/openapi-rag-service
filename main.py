@@ -37,7 +37,7 @@ STDOUT_OUTPUT_TEMPLATE = """
 {{render(output_value)}}
 """
 
-# ----------- filters ----------------
+# ----------- filters and routers ----------------
 
 
 def change_role_to_user(messages: List[ChatMessage]):
@@ -67,6 +67,40 @@ cf = {
         "change_role": change_role_to_user,
         "prepare_fc_params": prepare_fc_params
     }
+
+
+def gen_text_routes():
+    return [
+        {
+            "condition": "{{has_output_schema}}",
+            "output": "{{messages}}",
+            "output_name": "needs_function_calling",
+            "output_type": List[ChatMessage],
+        },
+        {
+            "condition": "{{not has_output_schema}}",
+            "output": "{{messages}}",
+            "output_name": "no_need_for_function_calling",
+            "output_type": List[ChatMessage],
+        },
+    ]
+
+
+def invoke_service_routes():
+    return [
+        {
+            "condition": "{{has_json_schema}}",
+            "output": "{{messages}}",
+            "output_name": "with_error_correction",
+            "output_type": List[ChatMessage],
+        },
+        {
+            "condition": "{{not has_json_schema}}",
+            "output": "{{messages}}",
+            "output_name": "no_error_correction",
+            "output_type": List[ChatMessage],
+        },
+    ]
 
 
 # ----------- util.py ----------------
@@ -206,7 +240,7 @@ class FormattedOutputTarget:
         template (str): A string template for formatting the output.
     """
 
-    destination: Union[str, TextIO]
+    destination: str
     template: str
 
     def get_file_handle(self, mode: str = "a"):
@@ -217,14 +251,14 @@ class FormattedOutputTarget:
         :param mode: The mode in which to open the file. Default is 'a' (append mode).
         :return: A context manager managing the file handle.
         """
-        if isinstance(self.destination, str):
-            try:
-                return open(self.destination, mode)
-            except IOError as e:
-                logging.error(f"Failed to open file {self.destination}: {e}")
-                raise
-        else:
-            return contextlib.nullcontext(self.destination)
+
+        if self.destination == "stdout":
+            return contextlib.redirect_stdout(sys.stdout)
+        try:
+            return open(self.destination, mode)
+        except IOError as e:
+            logging.error(f"Failed to open file {self.destination}: {e}")
+            raise
 
 
 @component
@@ -416,22 +450,6 @@ if __name__ == "__main__":
         print("Exiting, user prompt contains the word 'skip'.")
         sys.exit(0)
 
-    routes = [
-        {
-            "condition": "{{has_json_schema}}",
-            "output": "{{messages}}",
-            "output_name": "with_error_correction",
-            "output_type": List[ChatMessage],
-        },
-        {
-            "condition": "{{not has_json_schema}}",
-            "output": "{{messages}}",
-            "output_name": "no_error_correction",
-            "output_type": List[ChatMessage],
-        },
-    ]
-
-    fc_error_handling = ConditionalRouter(routes)
     invoke_service_pipe = Pipeline()
     invoke_service_pipe.add_component("fetcher", LinkContentFetcher())
     invoke_service_pipe.add_component("mx_fetcher", Multiplexer(List[ByteStream]))
@@ -444,7 +462,7 @@ if __name__ == "__main__":
     invoke_service_pipe.add_component("mx_function_llm", Multiplexer(List[ChatMessage]))
     invoke_service_pipe.add_component("mx_openapi_container", Multiplexer(List[ChatMessage]))
     invoke_service_pipe.add_component("function_llm", OpenAIChatGenerator(model=function_calling_model_name))
-    invoke_service_pipe.add_component("router", fc_error_handling)
+    invoke_service_pipe.add_component("router", ConditionalRouter(invoke_service_routes()))
     invoke_service_pipe.add_component("schema_validator", JsonSchemaValidator())
     invoke_service_pipe.add_component("openapi_container", OpenAPIServiceConnector())
     invoke_service_pipe.add_component("a5", OutputAdapter("{{ resp[0].content|json_loads }}", Dict[str, Any], cf))
@@ -495,26 +513,11 @@ if __name__ == "__main__":
     # we are now ready to generate the final text
 
     gen_text_pipeline = Pipeline()
-    routes = [
-        {
-            "condition": "{{has_output_schema}}",
-            "output": "{{messages}}",
-            "output_name": "needs_function_calling",
-            "output_type": List[ChatMessage],
-        },
-        {
-            "condition": "{{not has_output_schema}}",
-            "output": "{{messages}}",
-            "output_name": "no_need_for_function_calling",
-            "output_type": List[ChatMessage],
-        },
-    ]
-
     gen_text_pipeline.add_component(
         "llm", OpenAIChatGenerator(model=text_generation_model_name, generation_kwargs={"max_tokens": 2560})
     )
     gen_text_pipeline.add_component("post", LLMJSONFormatEnforcer())
-    gen_text_pipeline.add_component("router", ConditionalRouter(routes))
+    gen_text_pipeline.add_component("router", ConditionalRouter(gen_text_routes()))
     gen_text_pipeline.add_component("a1", OutputAdapter("{{json_schema | prepare_fc_params}}", Dict[str, Any], cf))
     gen_text_pipeline.add_component("a3",
                                     OutputAdapter("{{messages | change_role}}", List[ChatMessage], cf))
@@ -548,8 +551,7 @@ if __name__ == "__main__":
     output_sinks = [FormattedOutputTarget(github_output_file, GITHUB_OUTPUT_TEMPLATE)] if github_output_file else []
     # always output to stdout for debugging unless quiet mode is enabled
     if not get_env_var_or_default(env_var_name="QUIET", default_value=False):
-        output_sinks.append(FormattedOutputTarget(sys.stdout, STDOUT_OUTPUT_TEMPLATE))
-
+        output_sinks.append(FormattedOutputTarget("stdout", STDOUT_OUTPUT_TEMPLATE))
     print("Running gen_text_pipeline pipeline...")
     gen_text_pipeline.run(
         data={
