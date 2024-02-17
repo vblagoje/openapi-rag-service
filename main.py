@@ -22,7 +22,7 @@ from haystack.components.generators.chat import OpenAIChatGenerator
 from haystack.components.others import Multiplexer
 from haystack.components.routers import ConditionalRouter
 from haystack.components.validators import JsonSchemaValidator
-from haystack.dataclasses import ByteStream
+from haystack.dataclasses import ByteStream, ChatRole
 from haystack.dataclasses import ChatMessage
 from jinja2 import Template
 
@@ -36,6 +36,37 @@ STDOUT_OUTPUT_TEMPLATE = """
 {{output_name}}:
 {{render(output_value)}}
 """
+
+# ----------- filters ----------------
+
+
+def change_role_to_user(messages: List[ChatMessage]):
+    messages[-1].role = ChatRole.USER
+    messages[-1].meta = None
+    return messages
+
+
+def prepare_fc_params(openai_functions_schema: Dict[str, Any]) -> Dict[str, Any]:
+    if openai_functions_schema:
+        return {
+            "tools": [{
+                "type": "function",
+                "function": openai_functions_schema
+            }],
+            "tool_choice": {
+                "type": "function",
+                "function": {"name": openai_functions_schema["name"]}
+            }
+        }
+    else:
+        return {}
+
+
+cf = {
+        "json_loads": lambda s: json.loads(s) if isinstance(s, str) else json.loads(str(s)),
+        "change_role": change_role_to_user,
+        "prepare_fc_params": prepare_fc_params
+    }
 
 
 # ----------- util.py ----------------
@@ -385,12 +416,6 @@ if __name__ == "__main__":
         print("Exiting, user prompt contains the word 'skip'.")
         sys.exit(0)
 
-    gen_kwargs_template = """
-    {
-      "tools": [{"type": "function", "function": {{ openai_functions_definition | tojson }} }],
-      "tool_choice": {"type": "function", "function": {"name": "{{ openai_functions_definition.name }}"}} 
-    }
-    """
     routes = [
         {
             "condition": "{{has_json_schema}}",
@@ -405,17 +430,14 @@ if __name__ == "__main__":
             "output_type": List[ChatMessage],
         },
     ]
-    cf = {
-        "json_loads": lambda s: json.loads(s) if isinstance(s, str) else json.loads(str(s)),
-    }
+
     fc_error_handling = ConditionalRouter(routes)
     invoke_service_pipe = Pipeline()
     invoke_service_pipe.add_component("fetcher", LinkContentFetcher())
     invoke_service_pipe.add_component("mx_fetcher", Multiplexer(List[ByteStream]))
     invoke_service_pipe.add_component("spec_to_functions", OpenAPIServiceToFunctions())
     invoke_service_pipe.add_component("a1", OutputAdapter("{{ documents[0].content|json_loads }}", Dict[str, Any], cf))
-    invoke_service_pipe.add_component("a2", OutputAdapter(gen_kwargs_template, str))
-    invoke_service_pipe.add_component("a3", OutputAdapter("{{ generation_kwargs|json_loads }}", Dict[str, Any], cf))
+    invoke_service_pipe.add_component("a2", OutputAdapter("{{ fc_kwargs | prepare_fc_params }}", Dict[str, Any], cf))
     invoke_service_pipe.add_component("a4",
                                       OutputAdapter("{{ streams[0].to_string()|json_loads }}", Dict[str, Any], cf))
 
@@ -439,9 +461,8 @@ if __name__ == "__main__":
     invoke_service_pipe.connect("mx_fetcher", "a4")
     invoke_service_pipe.connect("mx_function_llm", "function_llm.messages")
     invoke_service_pipe.connect("spec_to_functions", "a1")
-    invoke_service_pipe.connect("a1", "a2")
-    invoke_service_pipe.connect("a2", "a3")
-    invoke_service_pipe.connect("a3", "function_llm.generation_kwargs")
+    invoke_service_pipe.connect("a1", "a2.fc_kwargs")
+    invoke_service_pipe.connect("a2", "function_llm.generation_kwargs")
     invoke_service_pipe.connect("a4", "openapi_container.service_openapi_spec")
     invoke_service_pipe.connect("openapi_container.service_response", "a5")
     invoke_service_pipe.connect("a5", "a6.json_resp")
@@ -489,22 +510,15 @@ if __name__ == "__main__":
         },
     ]
 
-    fc_gen_kwargs_template = """
-    {
-      "tools": [{"type": "function", "function": {{ output_schema_json | tojson }} }],
-      "tool_choice": {"type": "function", "function": {"name": "{{ output_schema_json.name }}"}} 
-    }
-    """
-
     gen_text_pipeline.add_component(
         "llm", OpenAIChatGenerator(model=text_generation_model_name, generation_kwargs={"max_tokens": 2560})
     )
     gen_text_pipeline.add_component("post", LLMJSONFormatEnforcer())
     gen_text_pipeline.add_component("router", ConditionalRouter(routes))
-    gen_text_pipeline.add_component("a1", OutputAdapter(fc_gen_kwargs_template, str))
-    gen_text_pipeline.add_component("a2", OutputAdapter("{{fc_gen_kwargs| json_loads}}", Dict[str, Any], cf))
+    gen_text_pipeline.add_component("a1", OutputAdapter("{{json_schema | prepare_fc_params}}", Dict[str, Any], cf))
     gen_text_pipeline.add_component("a3",
-                                    OutputAdapter("{{instruct_fc_1 + messages + instruct_fc_2}}", List[ChatMessage]))
+                                    OutputAdapter("{{messages | change_role}}", List[ChatMessage], cf))
+
     gen_text_pipeline.add_component("a4",
                                     OutputAdapter("{{messages[0].content | json_loads}}", Dict[str, Any], cf))
     gen_text_pipeline.add_component("a5",
@@ -525,8 +539,7 @@ if __name__ == "__main__":
     gen_text_pipeline.connect("a6", "mx_final_output")
     gen_text_pipeline.connect("schema_validator.validation_error", "mx_for_json_gen_llm")
     gen_text_pipeline.connect("mx_for_json_gen_llm", "a3.messages")
-    gen_text_pipeline.connect("a1", "a2.fc_gen_kwargs")
-    gen_text_pipeline.connect("a2", "json_gen_llm.generation_kwargs")
+    gen_text_pipeline.connect("a1", "json_gen_llm.generation_kwargs")
     gen_text_pipeline.connect("a3", "json_gen_llm.messages")
     gen_text_pipeline.connect("schema_validator.validated", "a4")
     gen_text_pipeline.connect("a4", "a5.json_payload")
@@ -543,10 +556,7 @@ if __name__ == "__main__":
             "messages": text_gen_messages,
             "has_output_schema": bool(output_schema),
             "output_key": output_key,
-            "output_schema_json": output_schema,
             "output_targets": output_sinks,
-            "json_schema": output_schema,
-            "instruct_fc_1": [ChatMessage.from_user("Next message contains data that can be extracted into a JSON")],
-            "instruct_fc_2": [ChatMessage.from_user("Extract data from previous assistant message into JSON format")],
+            "json_schema": output_schema
         }
     )
