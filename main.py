@@ -493,7 +493,6 @@ if __name__ == "__main__":
     invoke_service_pipe.connect("schema_validator.validated", "mx_openapi_container")
     invoke_service_pipe.connect("schema_validator.validation_error", "mx_function_llm")
 
-    print("Running invoke_service_pipe pipeline...")
     service_response = invoke_service_pipe.run(
         data={
             "fetcher": {"urls": open_api_spec},
@@ -552,7 +551,6 @@ if __name__ == "__main__":
     # always output to stdout for debugging unless quiet mode is enabled
     if not get_env_var_or_default(env_var_name="QUIET", default_value=False):
         output_sinks.append(FormattedOutputTarget("stdout", STDOUT_OUTPUT_TEMPLATE))
-    print("Running gen_text_pipeline pipeline...")
     gen_text_pipeline.run(
         data={
             "messages": text_gen_messages,
