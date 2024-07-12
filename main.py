@@ -15,15 +15,17 @@ from urllib.parse import urlparse
 import requests
 from haystack import Pipeline
 from haystack import component
-from haystack.components.connectors import OpenAPIServiceConnector
-from haystack.components.converters import OpenAPIServiceToFunctions, OutputAdapter
-from haystack.components.fetchers import LinkContentFetcher
+from haystack.components.converters import OutputAdapter
 from haystack.components.generators.chat import OpenAIChatGenerator
-from haystack.components.others import Multiplexer
+from haystack.components.joiners import BranchJoiner
 from haystack.components.routers import ConditionalRouter
 from haystack.components.validators import JsonSchemaValidator
-from haystack.dataclasses import ByteStream, ChatRole
+from haystack.dataclasses import ChatRole
 from haystack.dataclasses import ChatMessage
+from haystack.utils import Secret
+
+from haystack_experimental.components.tools.openapi import OpenAPITool, LLMProvider
+
 from jinja2 import Template
 
 GITHUB_OUTPUT_TEMPLATE = """
@@ -49,24 +51,21 @@ def change_role_to_user(messages: List[ChatMessage]):
 def prepare_fc_params(openai_functions_schema: Dict[str, Any]) -> Dict[str, Any]:
     if openai_functions_schema:
         return {
-            "tools": [{
-                "type": "function",
-                "function": openai_functions_schema
-            }],
+            "tools": [{"type": "function", "function": openai_functions_schema}],
             "tool_choice": {
                 "type": "function",
-                "function": {"name": openai_functions_schema["name"]}
-            }
+                "function": {"name": openai_functions_schema["name"]},
+            },
         }
     else:
         return {}
 
 
 cf = {
-        "json_loads": lambda s: json.loads(s) if isinstance(s, str) else json.loads(str(s)),
-        "change_role": change_role_to_user,
-        "prepare_fc_params": prepare_fc_params
-    }
+    "json_loads": lambda s: json.loads(s) if isinstance(s, str) else json.loads(str(s)),
+    "change_role": change_role_to_user,
+    "prepare_fc_params": prepare_fc_params,
+}
 
 
 def gen_text_routes():
@@ -105,8 +104,9 @@ def invoke_service_routes():
 
 # ----------- util.py ----------------
 
+
 def get_env_var_or_default(
-        env_var_name: str, default_value: Optional[Any] = None, required: bool = False
+    env_var_name: str, default_value: Optional[Any] = None, required: bool = False
 ) -> Optional[str]:
     """
     Retrieves the value of an environment variable if it exists, otherwise returns a default value or raises an
@@ -127,7 +127,9 @@ def get_env_var_or_default(
     if default_value is not None:
         return default_value
     if required:
-        raise ValueError(f"The required environment variable '{env_var_name}' is not set.")
+        raise ValueError(
+            f"The required environment variable '{env_var_name}' is not set."
+        )
     return None
 
 
@@ -141,7 +143,9 @@ def is_valid_url(location: str):
     return bool(parsed.netloc)
 
 
-def fetch_content_from(locations: List[str], required: Optional[bool] = False) -> Optional[str]:
+def fetch_content_from(
+    locations: List[str], required: Optional[bool] = False
+) -> Optional[str]:
     """
     Attempts to load content from a given list of locations. These locations can be URLs, file paths,
     or environment variable names. The function tries each location in order and returns the content
@@ -183,7 +187,9 @@ def fetch_content_from(locations: List[str], required: Optional[bool] = False) -
             continue
 
     if required:
-        raise ValueError(f"Failed to load text from any of the provided locations {locations}")
+        raise ValueError(
+            f"Failed to load text from any of the provided locations {locations}"
+        )
     return None
 
 
@@ -263,11 +269,28 @@ class FormattedOutputTarget:
 
 @component
 class OpenAPIServiceResponseTextGeneration:
-    def run(self, openapi_service_response: Dict[str, Any], system_prompt: str, user_prompt: Optional[str] = None):
-        service_response_message = ChatMessage.from_user(json.dumps(openapi_service_response))
+    def run(
+        self,
+        openapi_service_response: List[ChatMessage],
+        subtree: str,
+        system_prompt: str,
+        user_prompt: Optional[str] = None,
+    ):
+        service_response_msg = json.loads(openapi_service_response[0].content)
+        service_response_msg = (
+            service_response_msg[subtree] if subtree else service_response_msg
+        )
+
+        service_response_message = ChatMessage.from_user(
+            json.dumps(service_response_msg)
+        )
         sys_message = ChatMessage.from_system(system_prompt)
         if user_prompt:
-            text_gen_prompt = [sys_message] + [service_response_message] + [ChatMessage.from_user(user_prompt)]
+            text_gen_prompt = (
+                [sys_message]
+                + [service_response_message]
+                + [ChatMessage.from_user(user_prompt)]
+            )
         else:
             text_gen_prompt = [sys_message] + [service_response_message]
 
@@ -298,7 +321,9 @@ class LLMJSONFormatEnforcer:
         if not self.is_valid_json(modified_message.content):
             # Attempt to remove the outermost code block and check for valid JSON again
             resp = self.remove_outer_code_blocks(modified_message.content)
-            modified_message.content = json.dumps({output_key: resp}) if not self.is_valid_json(resp) else resp
+            modified_message.content = (
+                json.dumps({output_key: resp}) if not self.is_valid_json(resp) else resp
+            )
 
         # Replace the last message with the modified copy
         messages[-1] = modified_message
@@ -347,7 +372,9 @@ class FormattedOutputProcessor:
     """
 
     @component.output_types(output=List[Dict[str, Any]])
-    def run(self, json_object: Dict[str, Any], output_targets: List[FormattedOutputTarget]):
+    def run(
+        self, json_object: Dict[str, Any], output_targets: List[FormattedOutputTarget]
+    ):
         """
         Iterates over a collection of JSON objects and output targets, writing each JSON object
         to the specified targets with appropriate formatting.
@@ -378,7 +405,9 @@ class FormattedOutputProcessor:
         :param output_name: The name of the output for which to fetch the formatter.
         :return: A function that takes a value and returns a formatted output.
         """
-        template_name = get_env_var_or_default(env_var_name=output_name.upper() + "_TEMPLATE")
+        template_name = get_env_var_or_default(
+            env_var_name=output_name.upper() + "_TEMPLATE"
+        )
         template_str = fetch_content_from([template_name]) if template_name else None
 
         if template_str:
@@ -389,7 +418,9 @@ class FormattedOutputProcessor:
             # If no template is found, return the original value as is
             return lambda value: value
 
-    def write_formatted_output(self, data_to_write: Dict[str, Any], file_target: FormattedOutputTarget):
+    def write_formatted_output(
+        self, data_to_write: Dict[str, Any], file_target: FormattedOutputTarget
+    ):
         """
         Writes a given data object to the specified output target using the provided template.
         The output is formatted based on the template associated with each output name within the data.
@@ -401,7 +432,9 @@ class FormattedOutputProcessor:
             template = Template(file_target.template)
             for output_name, output_value in data_to_write.items():
                 output_value_renderer = self.fetch_output_formatter(output_name)
-                delimiter_value = self.create_unique_delimiter()  # Generate once for each output
+                delimiter_value = (
+                    self.create_unique_delimiter()
+                )  # Generate once for each output
                 formatted_output = template.render(
                     output_name=output_name,
                     output_value=output_value,
@@ -417,120 +450,96 @@ class FormattedOutputProcessor:
 
 if __name__ == "__main__":
     # make sure we have the required environment variables and have content for the required files
-    get_env_var_or_default(env_var_name="OPENAI_API_KEY", required=True)
-    open_api_spec = [get_env_var_or_default(env_var_name="OPENAPI_SERVICE_SPEC", required=True)]
+    get_env_var_or_default("OPENAI_API_KEY", required=True)
+    open_api_spec_url = get_env_var_or_default("OPENAPI_SERVICE_SPEC", required=True)
     system_prompt_text = fetch_content_from(
-        [get_env_var_or_default(env_var_name="SYSTEM_PROMPT", required=True)], required=True
+        [get_env_var_or_default("SYSTEM_PROMPT", required=True)],
+        required=True,
     )
     function_calling_prompt = get_env_var_or_default(env_var_name="FUNCTION_CALLING_PROMPT", required=True)
 
     # and the optional environment variables
-    text_generation_model_name = get_env_var_or_default(
-        env_var_name="TEXT_GENERATION_MODEL", default_value="gpt-4-1106-preview"
-    )
-    function_calling_model_name = get_env_var_or_default(
-        env_var_name="FUNCTION_CALLING_MODEL", default_value="gpt-3.5-turbo-0613"
-    )
-    fc_json_schema = get_env_var_or_default(env_var_name="FUNCTION_CALLING_VALIDATION_SCHEMA")
+    text_generation_model_name = get_env_var_or_default("TEXT_GENERATION_MODEL", "gpt-4o")
+    function_calling_model_name = get_env_var_or_default("FUNCTION_CALLING_MODEL", "gpt-3.5-turbo")
+    fc_json_schema = get_env_var_or_default("FUNCTION_CALLING_VALIDATION_SCHEMA")
     fc_json_schema = fetch_content_from([fc_json_schema]) if fc_json_schema else None
     fc_json_schema = json.loads(fc_json_schema) if fc_json_schema else None
-    github_output_file = get_env_var_or_default(env_var_name="GITHUB_OUTPUT")
-    output_key = get_env_var_or_default(env_var_name="OUTPUT_KEY", default_value="text_generation")
-    output_schema = get_env_var_or_default(env_var_name="OUTPUT_SCHEMA")
+    github_output_file = get_env_var_or_default("GITHUB_OUTPUT")
+    output_key = get_env_var_or_default("OUTPUT_KEY","text_generation")
+    output_schema = get_env_var_or_default("OUTPUT_SCHEMA")
     output_schema = fetch_content_from([output_schema]) if output_schema else None
     output_schema = json.loads(output_schema) if output_schema else None
-    bot_name = get_env_var_or_default(env_var_name="BOT_NAME")
-    service_token = get_env_var_or_default(env_var_name="OPENAPI_SERVICE_TOKEN")
-    user_prompt = get_env_var_or_default(env_var_name="USER_PROMPT")
+    bot_name = get_env_var_or_default("BOT_NAME")
+    service_token = get_env_var_or_default("OPENAPI_SERVICE_TOKEN")
+    user_prompt = get_env_var_or_default("USER_PROMPT")
     user_prompt = fetch_content_from([user_prompt]) if user_prompt else None
-    service_response_subtree = get_env_var_or_default(env_var_name="SERVICE_RESPONSE_SUBTREE")
-    user_instruction = extract_custom_instruction(bot_name, user_prompt) if user_prompt and bot_name else None
+    service_response_subtree = get_env_var_or_default("SERVICE_RESPONSE_SUBTREE")
+    user_instruction = (
+        extract_custom_instruction(bot_name, user_prompt)
+        if user_prompt and bot_name
+        else None
+    )
 
     if user_instruction and contains_skip_instruction(user_instruction):
         print("Exiting, user prompt contains the word 'skip'.")
         sys.exit(0)
 
     invoke_service_pipe = Pipeline()
-    invoke_service_pipe.add_component("fetcher", LinkContentFetcher())
-    invoke_service_pipe.add_component("mx_fetcher", Multiplexer(List[ByteStream]))
-    invoke_service_pipe.add_component("spec_to_functions", OpenAPIServiceToFunctions())
-    invoke_service_pipe.add_component("a1", OutputAdapter("{{ documents[0].content|json_loads }}", Dict[str, Any], cf))
-    invoke_service_pipe.add_component("a2", OutputAdapter("{{ fc_kwargs | prepare_fc_params }}", Dict[str, Any], cf))
-    invoke_service_pipe.add_component("a4",
-                                      OutputAdapter("{{ streams[0].to_string()|json_loads }}", Dict[str, Any], cf))
-
-    invoke_service_pipe.add_component("mx_function_llm", Multiplexer(List[ChatMessage]))
-    invoke_service_pipe.add_component("mx_openapi_container", Multiplexer(List[ChatMessage]))
-    invoke_service_pipe.add_component("function_llm", OpenAIChatGenerator(model=function_calling_model_name))
-    invoke_service_pipe.add_component("router", ConditionalRouter(invoke_service_routes()))
-    invoke_service_pipe.add_component("schema_validator", JsonSchemaValidator())
-    invoke_service_pipe.add_component("openapi_container", OpenAPIServiceConnector())
-    invoke_service_pipe.add_component("a5", OutputAdapter("{{ resp[0].content|json_loads }}", Dict[str, Any], cf))
     invoke_service_pipe.add_component(
-        "a6", OutputAdapter("{{ json_resp[subtree] if subtree is not none else json_resp }}", Dict[str, Any])
+        "openapi_service",
+        OpenAPITool(
+            generator_api=LLMProvider.OPENAI,
+            generator_api_params={"api_key": Secret.from_env_var("OPENAI_API_KEY"),
+                                  "model": function_calling_model_name,
+                                  "api_base_url": os.environ.get("OPENAI_API_BASE_URL")},
+        ),
     )
-    invoke_service_pipe.add_component(
-        "a7", OutputAdapter("{{ previous_messages + messages }}", List[ChatMessage])
-    )
-    invoke_service_pipe.add_component("final_prompt_start", OpenAPIServiceResponseTextGeneration())
-
-    invoke_service_pipe.connect("fetcher", "mx_fetcher")
-    invoke_service_pipe.connect("mx_fetcher", "spec_to_functions.sources")
-    invoke_service_pipe.connect("mx_fetcher", "a4")
-    invoke_service_pipe.connect("mx_function_llm", "function_llm.messages")
-    invoke_service_pipe.connect("spec_to_functions", "a1")
-    invoke_service_pipe.connect("a1", "a2.fc_kwargs")
-    invoke_service_pipe.connect("a2", "function_llm.generation_kwargs")
-    invoke_service_pipe.connect("a4", "openapi_container.service_openapi_spec")
-    invoke_service_pipe.connect("openapi_container.service_response", "a5")
-    invoke_service_pipe.connect("a5", "a6.json_resp")
-    invoke_service_pipe.connect("a6", "final_prompt_start.openapi_service_response")
-    invoke_service_pipe.connect("function_llm.replies", "router.messages")
-    invoke_service_pipe.connect("router.with_error_correction", "a7.messages")
-    invoke_service_pipe.connect("a7", "schema_validator.messages")
-    invoke_service_pipe.connect("router.no_error_correction", "mx_openapi_container")
-    invoke_service_pipe.connect("mx_openapi_container", "openapi_container.messages")
-    invoke_service_pipe.connect("schema_validator.validated", "mx_openapi_container")
-    invoke_service_pipe.connect("schema_validator.validation_error", "mx_function_llm")
-
+    invoke_service_pipe.add_component("final_prompt", OpenAPIServiceResponseTextGeneration())
+    invoke_service_pipe.connect("openapi_service.service_response","final_prompt.openapi_service_response")
     service_response = invoke_service_pipe.run(
         data={
-            "fetcher": {"urls": open_api_spec},
-            "mx_function_llm": {"value": [ChatMessage.from_user(function_calling_prompt)]},
-            "router": {"has_json_schema": bool(fc_json_schema)},
-            "openapi_container": {"service_credentials": service_token},
-            "schema_validator": {
-                "json_schema": fc_json_schema,
+            "openapi_service": {
+                "messages": [ChatMessage.from_user(function_calling_prompt)],
+                "credentials": Secret.from_token(service_token),
+                "spec": open_api_spec_url,
             },
-            "a6": {"subtree": service_response_subtree},
-            "a7": {"previous_messages": [ChatMessage.from_user(function_calling_prompt)]},
-            "final_prompt_start": {"system_prompt": system_prompt_text, "user_prompt": user_instruction},
+            "final_prompt": {
+                "subtree": service_response_subtree,
+                "system_prompt": system_prompt_text,
+                "user_prompt": user_instruction,
+            },
         }
     )
 
-    text_gen_messages = service_response["final_prompt_start"]["prompt_messages"]
+    text_gen_messages = service_response["final_prompt"]["prompt_messages"]
     # we are now ready to generate the final text
 
     gen_text_pipeline = Pipeline()
     gen_text_pipeline.add_component(
-        "llm", OpenAIChatGenerator(model=text_generation_model_name, generation_kwargs={"max_tokens": 2560})
+        "llm",
+        OpenAIChatGenerator(
+            model=text_generation_model_name, generation_kwargs={"max_tokens": 2560}
+        ),
     )
     gen_text_pipeline.add_component("post", LLMJSONFormatEnforcer())
     gen_text_pipeline.add_component("router", ConditionalRouter(gen_text_routes()))
     gen_text_pipeline.add_component("a1", OutputAdapter("{{json_schema | prepare_fc_params}}", Dict[str, Any], cf))
-    gen_text_pipeline.add_component("a3",
-                                    OutputAdapter("{{messages | change_role}}", List[ChatMessage], cf))
+    gen_text_pipeline.add_component("a3", OutputAdapter("{{messages | change_role}}", List[ChatMessage], cf))
 
-    gen_text_pipeline.add_component("a4",
-                                    OutputAdapter("{{messages[0].content | json_loads}}", Dict[str, Any], cf))
-    gen_text_pipeline.add_component("a5",
-                                    OutputAdapter("{{json_payload[0]['function']['arguments'] | json_loads}}",
-                                                  Dict[str, Any], cf))
+    gen_text_pipeline.add_component("a4", OutputAdapter("{{messages[0].content | json_loads}}", Dict[str, Any], cf))
+    gen_text_pipeline.add_component(
+        "a5",
+        OutputAdapter(
+            "{{json_payload[0]['function']['arguments'] | json_loads}}",
+            Dict[str, Any],
+            cf,
+        ),
+    )
     gen_text_pipeline.add_component("a6", OutputAdapter("{{messages[0].content | json_loads}}", Dict[str, Any], cf))
     gen_text_pipeline.add_component("json_gen_llm", OpenAIChatGenerator(model=function_calling_model_name))
     gen_text_pipeline.add_component("schema_validator", JsonSchemaValidator())
-    gen_text_pipeline.add_component("mx_final_output", Multiplexer(Dict[str, Any]))
-    gen_text_pipeline.add_component("mx_for_json_gen_llm", Multiplexer(List[ChatMessage]))
+    gen_text_pipeline.add_component("mx_final_output", BranchJoiner(Dict[str, Any]))
+    gen_text_pipeline.add_component("mx_for_json_gen_llm", BranchJoiner(List[ChatMessage]))
     gen_text_pipeline.add_component("final_output", FormattedOutputProcessor())
     gen_text_pipeline.connect("llm.replies", "post.messages")
     gen_text_pipeline.connect("post.messages", "router")
@@ -547,7 +556,11 @@ if __name__ == "__main__":
     gen_text_pipeline.connect("a4", "a5.json_payload")
     gen_text_pipeline.connect("mx_final_output", "final_output.json_object")
 
-    output_sinks = [FormattedOutputTarget(github_output_file, GITHUB_OUTPUT_TEMPLATE)] if github_output_file else []
+    output_sinks = (
+        [FormattedOutputTarget(github_output_file, GITHUB_OUTPUT_TEMPLATE)]
+        if github_output_file
+        else []
+    )
     # always output to stdout for debugging unless quiet mode is enabled
     if not get_env_var_or_default(env_var_name="QUIET", default_value=False):
         output_sinks.append(FormattedOutputTarget("stdout", STDOUT_OUTPUT_TEMPLATE))
@@ -557,6 +570,6 @@ if __name__ == "__main__":
             "has_output_schema": bool(output_schema),
             "output_key": output_key,
             "output_targets": output_sinks,
-            "json_schema": output_schema
+            "json_schema": output_schema,
         }
     )
