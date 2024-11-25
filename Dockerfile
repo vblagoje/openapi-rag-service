@@ -1,4 +1,4 @@
-FROM deepset/haystack:base-main
+FROM deepset/haystack:base-v2.7.0
 
 # Copy files to the root directory (Don't change)
 # Enables smooth GitHub runner integration
