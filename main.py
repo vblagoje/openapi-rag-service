@@ -522,20 +522,21 @@ if __name__ == "__main__":
         ),
     )
     gen_text_pipeline.add_component("post", LLMJSONFormatEnforcer())
-    gen_text_pipeline.add_component("router", ConditionalRouter(gen_text_routes()))
-    gen_text_pipeline.add_component("a1", OutputAdapter("{{json_schema | prepare_fc_params}}", Dict[str, Any], cf))
-    gen_text_pipeline.add_component("a3", OutputAdapter("{{messages | change_role}}", List[ChatMessage], cf))
+    gen_text_pipeline.add_component("router", ConditionalRouter(routes=gen_text_routes(), unsafe=True))
+    gen_text_pipeline.add_component("a1", OutputAdapter("{{json_schema | prepare_fc_params}}", Dict[str, Any], cf, unsafe=True))
+    gen_text_pipeline.add_component("a3", OutputAdapter("{{messages | change_role}}", List[ChatMessage], cf, unsafe=True))
 
-    gen_text_pipeline.add_component("a4", OutputAdapter("{{messages[0].content | json_loads}}", Dict[str, Any], cf))
+    gen_text_pipeline.add_component("a4", OutputAdapter("{{messages[0].content | json_loads}}", Dict[str, Any], cf, unsafe=True))
     gen_text_pipeline.add_component(
         "a5",
         OutputAdapter(
             "{{json_payload[0]['function']['arguments'] | json_loads}}",
             Dict[str, Any],
             cf,
+            unsafe=True,
         ),
     )
-    gen_text_pipeline.add_component("a6", OutputAdapter("{{messages[0].content | json_loads}}", Dict[str, Any], cf))
+    gen_text_pipeline.add_component("a6", OutputAdapter("{{messages[0].content | json_loads}}", Dict[str, Any], cf, unsafe=True))
     gen_text_pipeline.add_component("json_gen_llm", OpenAIChatGenerator(model=function_calling_model_name))
     gen_text_pipeline.add_component("schema_validator", JsonSchemaValidator())
     gen_text_pipeline.add_component("mx_final_output", BranchJoiner(Dict[str, Any]))
